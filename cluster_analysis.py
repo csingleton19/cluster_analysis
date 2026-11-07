@@ -17,10 +17,19 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from pathlib import Path
 import sys
 from scipy.stats import gaussian_kde
 from sklearn.neighbors import KernelDensity
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 try:
     HAS_MATPLOTLIB = True
@@ -40,19 +49,33 @@ TOL_LOGLIKE = 1e-5
 MIN_MEMBERS = 10
 MAX_PI = 0.08
 MIN_PI = 0.001
+MAX_PI_HARD = 0.35
 
 # Quality thresholds
 OVERLAP_PM_PLX_MIN = 0.3
 OVERLAP_JOINT_PM_MIN = 0.5
 OVERLAP_JOINT_PLX_MIN = 0.5
+CORE_MEMBER_PROB_THRESHOLD = 0.8
 
 # Gaia quality cuts
 RUWE_MAX = 1.4
 MIN_VISIBILITY_PERIODS = 8
 MIN_PARALLAX_ERROR_RATIO = 3.0
 
+# Standardized CMD extinction diagnostic zoom box.
+# These limits are intentionally fixed, not auto-scaled, so raw vs extinction-
+# corrected CMD products always show the exact same CMD window.
+CMD_EXTINCTION_BOX_COLOR_MIN = 0.90
+CMD_EXTINCTION_BOX_COLOR_MAX = 1.40
+CMD_EXTINCTION_BOX_MAG_MIN = 16.5
+CMD_EXTINCTION_BOX_MAG_MAX = 17.5
+
 # Field stays broad: min "sigma" in each direction (mas/yr). Prevents field collapse.
 FIELD_MIN_SIGMA_MAS = 5.0
+
+# Effective uncertainty floor for projected sky coordinates (degrees).
+# Prevents spatial dimensions from acting as zero-uncertainty channels.
+SPATIAL_ERROR_FLOOR_DEG = 0.05
 
 
 def load_astrometric_data(
@@ -83,15 +106,26 @@ def load_astrometric_data(
     if missing_cols:
         raise ValueError(f"Missing required measurement columns: {missing_cols}")
     
-    # Check for uncertainty columns
-    has_pmra_error = 'pmra_error' in df.columns
-    has_pmdec_error = 'pmdec_error' in df.columns
-    has_parallax_error = 'parallax_error' in df.columns
-    has_uncertainties = has_pmra_error and has_pmdec_error and has_parallax_error
-    
-    if not has_uncertainties:
-        quality_flags.append("NO_UNCERTAINTIES: running without measurement errors")
-    
+    error_cols = ["pmra_error", "pmdec_error", "parallax_error"]
+    has_error_cols = all(col in df.columns for col in error_cols)
+
+    # Determine whether Gaia query is needed:
+    # - any error column missing, OR
+    # - any star has NaN/non-positive uncertainty in any required column.
+    if has_error_cols:
+        bad_error_mask_pre = (
+            df["pmra_error"].isna()
+            | df["pmdec_error"].isna()
+            | df["parallax_error"].isna()
+            | (df["pmra_error"] <= 0)
+            | (df["pmdec_error"] <= 0)
+            | (df["parallax_error"] <= 0)
+        )
+        needs_gaia_error_query = bool(bad_error_mask_pre.any())
+    else:
+        bad_error_mask_pre = np.ones(len(df), dtype=bool)
+        needs_gaia_error_query = True
+
     # Apply Gaia quality cuts
     initial_n = len(df)
     
@@ -110,13 +144,19 @@ def load_astrometric_data(
         if removed > 0 and "RUWE_CUT" not in quality_flags:
             quality_flags.append(f"VISIBILITY_CUT: {removed} stars removed")
     
-    # Parallax error ratio cut (if available)
-    if 'parallax_over_error' in df.columns:
-        plx_ratio_mask = df['parallax_over_error'] >= MIN_PARALLAX_ERROR_RATIO
-        df = df[plx_ratio_mask]
-        removed = initial_n - len(df)
-        if removed > 0 and "RUWE_CUT" not in quality_flags and "VISIBILITY_CUT" not in quality_flags:
-            quality_flags.append(f"PARALLAX_RATIO_CUT: {removed} stars removed")
+    # Enforce strict uncertainty policy: no missing/non-positive uncertainties allowed.
+    bad_error_mask = (
+        df["pmra_error"].isna()
+        | df["pmdec_error"].isna()
+        | df["parallax_error"].isna()
+        | (df["pmra_error"] <= 0)
+        | (df["pmdec_error"] <= 0)
+        | (df["parallax_error"] <= 0)
+    )
+    if bad_error_mask.any():
+        n_bad = int(bad_error_mask.sum())
+        quality_flags.append(f"UNCERTAINTY_DROP: removed {n_bad} stars with unresolved missing/non-positive uncertainties")
+        df = df[~bad_error_mask].copy()
     
     # Check for valid astrometric measurements (only measurements, not errors)
     valid_mask = (
@@ -128,32 +168,17 @@ def load_astrometric_data(
     if len(df) < initial_n:
         quality_flags.append(f"VALIDITY_CUT: {initial_n - len(df)} stars removed due to invalid measurements")
     
-    # If uncertainties exist, check for positive errors
-    if has_uncertainties:
-        positive_error_mask = (
-            (df['pmra_error'] > 0) & 
-            (df['pmdec_error'] > 0) & 
-            (df['parallax_error'] > 0)
-        )
-        
-        invalid_errors = (~positive_error_mask).sum()
-        if invalid_errors > 0:
-            quality_flags.append(f"POSITIVE_ERROR_CUT: {invalid_errors} stars removed due to non-positive errors")
-            df = df[positive_error_mask].copy()
+    # No fallback/no-imputation policy for uncertainties.
     
     # Extract data arrays
     pm_data = df[[pmra_col, pmdec_col]].values.astype(np.float64)
     parallax_data = df[parallax_col].values.astype(np.float64)
     
-    # Extract error arrays if available, otherwise set to None
-    if has_uncertainties:
-        pmra_errors = df['pmra_error'].values.astype(np.float64)
-        pmdec_errors = df['pmdec_error'].values.astype(np.float64)
-        parallax_errors = df['parallax_error'].values.astype(np.float64)
-    else:
-        pmra_errors = None
-        pmdec_errors = None
-        parallax_errors = None
+    # Extract error arrays (required by policy)
+    pmra_errors = df['pmra_error'].values.astype(np.float64)
+    pmdec_errors = df['pmdec_error'].values.astype(np.float64)
+    parallax_errors = df['parallax_error'].values.astype(np.float64)
+    has_uncertainties = True
     
     # Reset index to ensure contiguous indices matching probability arrays
     df = df.reset_index(drop=True)
@@ -279,7 +304,16 @@ def mvnpdf_log_with_errors(pm: np.ndarray, center: np.ndarray, cov: np.ndarray, 
             diff = pm[i] - center
             cov_model = np.atleast_2d(cov) + COV_REG * np.eye(2)
             
-            # Add measurement errors for this star
+            # By policy, uncertainties should be validated upstream and always valid here.
+            if (
+                not np.isfinite(pmra_errors[i])
+                or not np.isfinite(pmdec_errors[i])
+                or pmra_errors[i] <= 0
+                or pmdec_errors[i] <= 0
+            ):
+                raise RuntimeError(
+                    "Encountered invalid PM uncertainties after validation stage"
+                )
             error_cov = np.diag([pmra_errors[i]**2, pmdec_errors[i]**2])
             cov_total = cov_model + error_cov
             
@@ -429,11 +463,11 @@ def fit_cluster_pm_only(
 
 
 def membership_tier(prob: np.ndarray) -> np.ndarray:
-    """Tiered labels: core / probable / candidate / non-member"""
+    """Tiered labels: core / probable / possible / non-member"""
     tier = np.full(len(prob), "non-member", dtype=object)
-    tier[prob >= 0.9] = "core"
-    tier[(prob >= 0.5) & (prob < 0.9)] = "probable"
-    tier[(prob >= 0.2) & (prob < 0.5)] = "candidate"
+    tier[prob >= CORE_MEMBER_PROB_THRESHOLD] = "core"
+    tier[(prob >= 0.6) & (prob < CORE_MEMBER_PROB_THRESHOLD)] = "probable"
+    tier[(prob >= 0.3) & (prob < 0.6)] = "possible"
     return tier
 
 
@@ -463,7 +497,7 @@ def fit_cluster_parallax_only(
     if center_init is None:
         center_init = np.median(parallax)
     if sigma_init is None:
-        sigma_init = np.std(parallax) * 0.5
+        sigma_init = np.std(parallax) * 0.6
     
     # Initial parameters
     center_c = float(center_init)
@@ -596,13 +630,18 @@ def fit_cluster_parallax_only(
 
 
 def add_projected_xy(df, ra0=None, dec0=None):
-    """Add projected spatial coordinates relative to cluster center"""
+    """Return local sky offsets, wrapping RA across the 0/360-degree boundary."""
+    ra = df["ra"].to_numpy(dtype=float)
     if ra0 is None:
-        ra0 = np.median(df["ra"])
+        # Take a median in a continuous angular interval around the circular
+        # mean. An ordinary RA median can put a boundary-crossing field at 180°.
+        angle = np.deg2rad(ra)
+        anchor = np.rad2deg(np.arctan2(np.nanmean(np.sin(angle)), np.nanmean(np.cos(angle))))
+        ra0 = (anchor + np.nanmedian((ra - anchor + 180.0) % 360.0 - 180.0)) % 360.0
     if dec0 is None:
-        dec0 = np.median(df["dec"])
+        dec0 = np.nanmedian(df["dec"])
 
-    x = (df["ra"].values - ra0) * np.cos(np.deg2rad(dec0))
+    x = ((ra - ra0 + 180.0) % 360.0 - 180.0) * np.cos(np.deg2rad(dec0))
     y = df["dec"].values - dec0
 
     return x, y, ra0, dec0
@@ -629,6 +668,101 @@ def estimate_sigma_spatial_core(x_sky, y_sky, frac=0.15):
     return sigma_spatial
 
 
+def compute_spatial_concentration(x: np.ndarray, y: np.ndarray, astro_prob: np.ndarray) -> float:
+    """Compute spatial concentration from astrometric probabilities.
+
+    concentration = field_r50 / core_r25, where
+      - core_r25: 25th percentile radius of top-20% astro_prob stars
+      - field_r50: 50th percentile radius of bottom-20% astro_prob stars
+    """
+    r = np.sqrt(x**2 + y**2)
+    p = np.asarray(astro_prob)
+    finite = np.isfinite(p) & np.isfinite(r)
+
+    if finite.sum() < 50:
+        return np.nan
+
+    p = p[finite]
+    rr = r[finite]
+
+    high_cut = np.quantile(p, 0.80)
+    low_cut = np.quantile(p, 0.20)
+    high = p >= high_cut
+    low = p <= low_cut
+
+    if high.sum() < 20 or low.sum() < 20:
+        return np.nan
+
+    core_radius = np.percentile(rr[high], 25)
+    field_radius = np.percentile(rr[low], 50)
+    return float(field_radius / max(core_radius, 1e-6))
+
+
+def concentration_to_spatial_weight(concentration: float, c_low: float = None, c_high: float = None) -> float:
+    """Map concentration to bounded spatial weight.
+
+    If calibrated bounds (c_low/c_high) are provided, use percentile-linear mapping.
+    Otherwise, use the legacy smooth tanh mapping as fallback.
+    """
+    SPATIAL_WEIGHT_MIN = 0.25
+    SPATIAL_WEIGHT_MAX = 0.75
+
+    if not np.isfinite(concentration):
+        return SPATIAL_WEIGHT_MIN
+
+    if c_low is not None and c_high is not None and np.isfinite(c_low) and np.isfinite(c_high):
+        z = (concentration - c_low) / max(c_high - c_low, 1e-6)
+        z = float(np.clip(z, 0.0, 1.0))
+        return SPATIAL_WEIGHT_MIN + z * (SPATIAL_WEIGHT_MAX - SPATIAL_WEIGHT_MIN)
+
+    # Fallback mapping (used only when global calibration thresholds are unavailable)
+    w = 0.25 + 0.5 * np.tanh((concentration - 1.5) / 2.0)
+    return float(np.clip(w, SPATIAL_WEIGHT_MIN, SPATIAL_WEIGHT_MAX))
+
+
+def adaptive_spatial_weight(
+    x: np.ndarray,
+    y: np.ndarray,
+    astro_prob: np.ndarray,
+    c_low: float = None,
+    c_high: float = None,
+) -> float:
+    """
+    Compute a bounded spatial weight based on how concentrated high-astrometric-probability
+    stars are relative to low-astrometric-probability stars.
+
+    Uses a quantile-based two-population contrast for robustness even when
+    probabilities are compressed:
+      high = top 20% of astro_prob
+      low  = bottom 20% of astro_prob
+
+    concentration = median_radius_low / median_radius_high
+
+    Maps concentration to a spatial weight in [0.35, 0.75] via a smooth tanh curve:
+      ~1.0  -> w ~0.35  (spatial not useful, barely weight it)
+      ~3.5  -> w ~0.60  (moderate spatial concentration, moderate weight)
+      ~7.0  -> w ~0.74  (strong concentration, near cap)
+
+    The cap at 0.75 prevents spatial from dominating astrometry even for very
+    compact clusters. The floor at 0.35 preserves a small spatial prior always.
+
+    Falls back to 0.35 if there are too few finite values or either quantile
+    population is too small.
+    """
+    concentration = compute_spatial_concentration(x, y, astro_prob)
+    weight = concentration_to_spatial_weight(concentration, c_low=c_low, c_high=c_high)
+
+    print(
+        f"  Spatial weight debug: "
+        f"concentration={concentration if np.isfinite(concentration) else np.nan:.3f}, "
+        f"c_low={c_low if c_low is not None else np.nan:.3f}, "
+        f"c_high={c_high if c_high is not None else np.nan:.3f}, "
+        f"weight={weight:.3f}"
+    )
+
+    return weight
+
+
 def generate_spatially_aware_seed(x_sky, y_sky):
     """Find densest region in sky for better seed initialization"""
     from sklearn.neighbors import KernelDensity
@@ -646,7 +780,7 @@ def fixed_field_component_nd(data: np.ndarray, pm_floor: float = None, plx_floor
     if pm_floor is None:
         pm_floor = FIELD_MIN_SIGMA_MAS
     if plx_floor is None:
-        plx_floor = 0.2  # Much smaller floor for parallax
+        plx_floor = 0.3  # Much smaller floor for parallax
         
     center = np.mean(data, axis=0)
     cov = np.cov(data.T)
@@ -699,8 +833,8 @@ def fixed_field_component_5d_normalized(data):
     cov = np.cov(data.T) + COV_REG * np.eye(5)
 
     floors = np.array([
-        0.5**2,    # pmra (normalized)
-        0.5**2,    # pmdec (normalized)
+        0.6**2,    # pmra (normalized)
+        0.6**2,    # pmdec (normalized)
         0.3**2,    # parallax (normalized)
         0.3**2,    # x sky (normalized)
         0.3**2,    # y sky (normalized)
@@ -714,24 +848,52 @@ def fixed_field_component_5d_normalized(data):
     return center, eigvecs @ np.diag(eigvals) @ eigvecs.T
 
 
-def mvnpdf_log_nd(data, center, cov):
-    """Generic N-dimensional multivariate normal log PDF (no uncertainties)"""
-    dim = data.shape[1]
+def mvnpdf_log_nd(data, center, cov, errors=None):
+    """Generic N-dimensional multivariate normal log PDF with optional uncertainties"""
+    n, dim = data.shape
     diff = data - center
-    cov = np.atleast_2d(cov) + COV_REG * np.eye(dim)
+    cov_model = np.atleast_2d(cov) + COV_REG * np.eye(dim)
+    
+    # Check if uncertainties are available
+    has_errors = errors is not None and errors.shape == (n, dim)
+    
+    if has_errors:
+        # Add measurement errors to covariance for each star
+        log_likelihood = np.zeros(n)
+        for i in range(n):
+            if np.any(np.isnan(errors[i])) or np.any(errors[i] <= 0):
+                raise RuntimeError(
+                    "Encountered invalid ND uncertainties after validation stage"
+                )
 
-    sign, logdet = np.linalg.slogdet(cov)
-    if sign <= 0:
-        return np.full(len(data), -1e10)
+            cov_total = cov_model + np.diag(errors[i]**2)
+            sign, logdet = np.linalg.slogdet(cov_total)
+            if sign <= 0:
+                log_likelihood[i] = -1e10
+                continue
 
-    try:
-        L = np.linalg.cholesky(cov)
-        solved = np.linalg.solve(L, diff.T)
-        quad = np.sum(solved**2, axis=0)
-    except np.linalg.LinAlgError:
-        return np.full(len(data), -1e10)
+            try:
+                L = np.linalg.cholesky(cov_total)
+                solved = np.linalg.solve(L, diff[i])
+                quad = np.sum(solved**2)
+                log_likelihood[i] = -0.5 * (dim * np.log(2 * np.pi) + logdet + quad)
+            except np.linalg.LinAlgError:
+                log_likelihood[i] = -1e10
+        return log_likelihood
+    else:
+        # No uncertainties - use standard calculation
+        sign, logdet = np.linalg.slogdet(cov_model)
+        if sign <= 0:
+            return np.full(len(data), -1e10)
 
-    return -0.5 * (dim * np.log(2 * np.pi) + logdet + quad)
+        try:
+            L = np.linalg.cholesky(cov_model)
+            solved = np.linalg.solve(L, diff.T)
+            quad = np.sum(solved**2, axis=0)
+        except np.linalg.LinAlgError:
+            return np.full(len(data), -1e10)
+
+        return -0.5 * (dim * np.log(2 * np.pi) + logdet + quad)
 
 
 def mvnpdf_log_3d(
@@ -755,7 +917,17 @@ def mvnpdf_log_3d(
             diff = data[i] - center
             cov_model = np.atleast_2d(cov) + COV_REG * np.eye(3)
             
-            # Add measurement errors for this star
+            if (
+                not np.isfinite(pmra_errors[i])
+                or not np.isfinite(pmdec_errors[i])
+                or not np.isfinite(parallax_errors[i])
+                or pmra_errors[i] <= 0
+                or pmdec_errors[i] <= 0
+                or parallax_errors[i] <= 0
+            ):
+                raise RuntimeError(
+                    "Encountered invalid 3D uncertainties after validation stage"
+                )
             error_cov = np.diag([pmra_errors[i]**2, pmdec_errors[i]**2, parallax_errors[i]**2])
             cov_total = cov_model + error_cov
             
@@ -797,9 +969,12 @@ def fit_cluster_nd(
     cov_init,
     center_field,
     cov_field,
+    errors=None,
     pi_cluster=None,
     max_iter=100,
     tol=1e-4,
+    min_pi: float = MIN_PI,
+    max_pi: float = MAX_PI,
 ):
     """Generic N-dimensional cluster fitting with EM algorithm"""
     if pi_cluster is None:
@@ -809,8 +984,8 @@ def fit_cluster_nd(
     cov_c = cov_init.copy()
 
     for _ in range(max_iter):
-        log_L_c = mvnpdf_log_nd(data, center_c, cov_c)
-        log_L_f = mvnpdf_log_nd(data, center_field, cov_field)
+        log_L_c = mvnpdf_log_nd(data, center_c, cov_c, errors)
+        log_L_f = mvnpdf_log_nd(data, center_field, cov_field, errors)
 
         log_p_c = np.log(max(pi_cluster, 1e-10)) + log_L_c
         log_p_f = np.log(max(1 - pi_cluster, 1e-10)) + log_L_f
@@ -825,9 +1000,19 @@ def fit_cluster_nd(
         center_new = np.average(data, axis=0, weights=w)
         diff = data - center_new
         cov_new = np.average(diff[:, :, None] * diff[:, None, :], axis=0, weights=w)
+        
+        # Add covariance cap for 5D joint model to prevent over-expansion
+        if data.shape[1] == 5:
+            max_sigma = np.array([0.6, 0.6, 0.35, 0.35, 0.35])
+            max_var = max_sigma**2
+            
+            # Remove cross-covariance to prevent tilted mega-net
+            cov_new = np.diag(np.minimum(np.diag(cov_new), max_var))
+        
+        # Update cluster covariance with regularization
         cov_new += COV_REG * np.eye(data.shape[1])
 
-        pi_new = np.clip(np.mean(prob), MIN_PI, MAX_PI)
+        pi_new = np.clip(np.mean(prob), min_pi, max_pi)
 
         if np.linalg.norm(center_new - center_c) < tol:
             center_c, cov_c, pi_cluster = center_new, cov_new, pi_new
@@ -836,8 +1021,8 @@ def fit_cluster_nd(
         center_c, cov_c, pi_cluster = center_new, cov_new, pi_new
 
     # Final probabilities
-    log_L_c = mvnpdf_log_nd(data, center_c, cov_c)
-    log_L_f = mvnpdf_log_nd(data, center_field, cov_field)
+    log_L_c = mvnpdf_log_nd(data, center_c, cov_c, errors)
+    log_L_f = mvnpdf_log_nd(data, center_field, cov_field, errors)
 
     log_p_c = np.log(max(pi_cluster, 1e-10)) + log_L_c
     log_p_f = np.log(max(1 - pi_cluster, 1e-10)) + log_L_f
@@ -877,7 +1062,7 @@ def fit_cluster_3d_joint(
     
     # Initialize cluster covariance with proper dimensional scaling
     sigma_pm = sigma_init
-    sigma_plx = max(0.05, 0.5 * np.std(parallax_data))
+    sigma_plx = max(0.05, 0.6 * np.std(parallax_data))
     cov_c = np.diag([
         sigma_pm**2,
         sigma_pm**2,
@@ -1018,12 +1203,45 @@ def generate_joint_seeds(pm_data: np.ndarray, parallax_data: np.ndarray) -> list
     return seeds
 
 
+def estimate_adaptive_max_pi(pm_data: np.ndarray) -> float:
+    """Estimate per-cluster max_pi from PM-space density contrast.
+
+    Uses local PM density relative to its median so the estimate is truly
+    cluster-dependent (not percentile-locked):
+      local_density = 1 / d_k
+      density_ratio = local_density / median(local_density)
+      dense_fraction = mean(density_ratio > 3)
+    """
+    try:
+        from sklearn.neighbors import NearestNeighbors
+
+        n = len(pm_data)
+        if n < 50:
+            return MAX_PI
+
+        k = min(15, max(5, n - 1))
+        nbrs = NearestNeighbors(n_neighbors=k + 1).fit(pm_data)
+        dists, _ = nbrs.kneighbors(pm_data)
+        dk = dists[:, -1]
+        local_density = 1.0 / np.maximum(dk, 1e-6)
+
+        median_density = np.median(local_density)
+        density_ratio = local_density / max(median_density, 1e-12)
+        dense_fraction = float(np.mean(density_ratio > 3.0))
+        max_pi_adaptive = np.clip(dense_fraction * 1.5, 0.08, 0.35)
+        return float(max_pi_adaptive)
+    except Exception:
+        return MAX_PI
+
+
 def run_multi_seed_pm(
     pm_data: np.ndarray,
     pmra_errors: np.ndarray = None,
     pmdec_errors: np.ndarray = None,
     center_field: np.ndarray = None,
     cov_field: np.ndarray = None,
+    min_pi: float = MIN_PI,
+    max_pi: float = MAX_PI,
 ) -> dict:
     """Run PM-only model with multiple seeds"""
     seeds = generate_pm_seeds(pm_data)
@@ -1034,7 +1252,9 @@ def run_multi_seed_pm(
             sigma_init = estimate_sigma_from_core(pm_data, seed_center)
             center, cov, prob, d_maha, pi_cluster = fit_cluster_pm_only(
                 pm_data, pmra_errors, pmdec_errors, seed_center, sigma_init,
-                center_field, cov_field
+                center_field, cov_field,
+                min_pi=min_pi,
+                max_pi=max_pi,
             )
             
             # Calculate log-likelihood
@@ -1080,6 +1300,8 @@ def run_multi_seed_pm(
 def run_multi_seed_parallax(
     parallax_data: np.ndarray,
     parallax_errors: np.ndarray = None,
+    min_pi: float = MIN_PI,
+    max_pi: float = MAX_PI,
 ) -> dict:
     """Run parallax-only model with multiple seeds"""
     seeds = generate_parallax_seeds(parallax_data)
@@ -1087,9 +1309,10 @@ def run_multi_seed_parallax(
     
     for seed_name, seed_center in seeds:
         try:
-            sigma_init = np.std(parallax_data) * 0.5  # Initial sigma estimate
+            sigma_init = np.std(parallax_data) * 0.6  # Initial sigma estimate
             center, sigma, prob, pi_cluster = fit_cluster_parallax_only(
-                parallax_data, parallax_errors, seed_center, sigma_init
+                parallax_data, parallax_errors, seed_center, sigma_init,
+                min_pi=min_pi, max_pi=max_pi,
             )
             
             # Calculate log-likelihood
@@ -1145,8 +1368,23 @@ def run_multi_seed_joint(
     df: pd.DataFrame = None,
     center_field: np.ndarray = None,
     cov_field: np.ndarray = None,
+    pmra_errors: np.ndarray = None,
+    pmdec_errors: np.ndarray = None,
+    parallax_errors: np.ndarray = None,
+    astro_prob: np.ndarray = None,
+    c_low: float = None,
+    c_high: float = None,
+    spatial_weight_override: float = None,
+    min_pi: float = MIN_PI,
+    max_pi: float = MAX_PI,
 ) -> dict:
-    """Run 5D spatial+astrometric model with multiple seeds"""
+    """Run 5D spatial+astrometric model with multiple seeds.
+
+    astro_prob: (n,) array of membership probabilities from the 3D astrometric
+    model (PM-only or PM+parallax).  Used to compute an adaptive spatial weight
+    so that sky position acts as a bounded prior rather than an equal 5th
+    dimension.  If None, falls back to the minimum spatial weight (0.35).
+    """
     # Add spatial coordinates
     x_sky, y_sky, _, _ = add_projected_xy(df)
     
@@ -1161,7 +1399,23 @@ def run_multi_seed_joint(
     
     # Normalize dimensions to balanced scale
     data_5d_norm, data_means, data_stds = normalize_data_5d(data_5d)
-    
+
+    # --- Adaptive spatial weighting ---
+    # Spatial position is a bounded prior, not an equal astrometric dimension.
+    # Use the astrometric model's probabilities to measure how concentrated
+    # cluster members are relative to confident non-members, then scale the
+    # normalized sky columns accordingly.
+    if spatial_weight_override is not None:
+        spatial_weight = float(np.clip(spatial_weight_override, 0.25, 0.75))
+        print(f"  Adaptive spatial weight override: {spatial_weight:.3f}")
+    elif astro_prob is not None:
+        spatial_weight = adaptive_spatial_weight(x_sky, y_sky, astro_prob, c_low=c_low, c_high=c_high)
+    else:
+        spatial_weight = 0.25  # conservative fallback: minimum weight
+    print(f"  Adaptive spatial weight: {spatial_weight:.3f}")
+    data_5d_norm[:, 3] *= spatial_weight
+    data_5d_norm[:, 4] *= spatial_weight
+
     # Create 5D field component if not provided (use normalized data)
     if center_field is None or cov_field is None:
         center_field, cov_field = fixed_field_component_5d_normalized(data_5d_norm)
@@ -1177,7 +1431,7 @@ def run_multi_seed_joint(
         try:
             # Initialize 5D cluster parameters with core-based spatial scaling
             sigma_pm = estimate_sigma_from_core(pm_data, seed_center[:2])
-            sigma_plx = max(0.05, 0.5 * np.std(parallax_data))
+            sigma_plx = max(0.05, 0.6 * np.std(parallax_data))
             sigma_spatial = estimate_sigma_spatial_core(x_sky, y_sky)
             
             # Convert 3D seed to 5D seed with spatially aware position
@@ -1191,23 +1445,60 @@ def run_multi_seed_joint(
             
             # Normalize seed center using same transform
             seed_center_5d = (seed_center_5d_raw - data_means) / data_stds
+            # Keep model parameterization consistent with weighted data space
+            seed_center_5d[3] *= spatial_weight
+            seed_center_5d[4] *= spatial_weight
             
             # Initialize 5D cluster covariance with proper scaling
             sigma_norm = np.array([sigma_pm, sigma_pm, sigma_plx, sigma_spatial, sigma_spatial]) / data_stds
             cov_init = np.diag(sigma_norm**2)
+            cov_init[3, 3] *= spatial_weight**2
+            cov_init[4, 4] *= spatial_weight**2
             
-            # Run 5D model with normalized data
+            # Prepare error matrix for 5D data
+            has_errors = (pmra_errors is not None) and (pmdec_errors is not None) and (parallax_errors is not None)
+            
+            if has_errors:
+                # Build 5D error matrix: [pmra_err, pmdec_err, parallax_err, x_err, y_err]
+                # Use raw errors, then normalize them like the data
+                errors_5d_raw = np.column_stack([
+                    pmra_errors,
+                    pmdec_errors,
+                    parallax_errors,
+                    np.full(len(df), SPATIAL_ERROR_FLOOR_DEG),  # x sky effective error
+                    np.full(len(df), SPATIAL_ERROR_FLOOR_DEG),  # y sky effective error
+                ])
+                # Normalize errors using same transform as data
+                errors_5d = errors_5d_raw / data_stds
+                # Keep uncertainties in same weighted space as weighted sky data
+                errors_5d[:, 3] *= spatial_weight
+                errors_5d[:, 4] *= spatial_weight
+            else:
+                errors_5d = None
+            
+            # Run 5D model with normalized data and uncertainties
             center_norm, cov_norm, prob, pi_cluster = fit_cluster_nd(
-                data_5d_norm, seed_center_5d, cov_init, center_field, cov_field
+                data_5d_norm, seed_center_5d, cov_init, center_field, cov_field, errors_5d,
+                min_pi=min_pi, max_pi=max_pi,
             )
             
-            # Convert results back to original scale
-            center = center_norm * data_stds + data_means
-            cov = cov_norm * np.outer(data_stds, data_stds)
+            # Convert results back to original scale.
+            # Undo spatial weighting in model coordinates before denormalization.
+            center_unweighted = center_norm.copy()
+            center_unweighted[3] /= max(spatial_weight, 1e-8)
+            center_unweighted[4] /= max(spatial_weight, 1e-8)
+            center = center_unweighted * data_stds + data_means
+
+            cov_unweighted = cov_norm.copy()
+            unweight_scale = np.ones(5)
+            unweight_scale[3] = 1.0 / max(spatial_weight, 1e-8)
+            unweight_scale[4] = 1.0 / max(spatial_weight, 1e-8)
+            cov_unweighted = cov_unweighted * np.outer(unweight_scale, unweight_scale)
+            cov = cov_unweighted * np.outer(data_stds, data_stds)
             
-            # Calculate log-likelihood using normalized space (consistent coordinate system)
-            log_L_c = mvnpdf_log_nd(data_5d_norm, center_norm, cov_norm)
-            log_L_f = mvnpdf_log_nd(data_5d_norm, center_field, cov_field)
+            # Calculate log-likelihood using normalized space with uncertainties
+            log_L_c = mvnpdf_log_nd(data_5d_norm, center_norm, cov_norm, errors_5d)
+            log_L_f = mvnpdf_log_nd(data_5d_norm, center_field, cov_field, errors_5d)
             log_p_c = np.log(max(pi_cluster, 1e-10)) + log_L_c
             log_p_f = np.log(max(1 - pi_cluster, 1e-10)) + log_L_f
             max_log = np.maximum(log_p_c, log_p_f)
@@ -1249,10 +1540,10 @@ def compute_model_overlaps(pm_prob: np.ndarray, plx_prob: np.ndarray, joint_prob
     """Compute overlap metrics between different model probability assignments"""
     overlaps = {}
     
-    # Define core members (P >= 0.9)
-    pm_core = pm_prob >= 0.9
-    plx_core = plx_prob >= 0.9
-    joint_core = joint_prob >= 0.9
+    # Define core members (P >= 0.8)
+    pm_core = pm_prob >= 0.8
+    plx_core = plx_prob >= 0.8
+    joint_core = joint_prob >= 0.8
     
     # PM-Parallax overlap
     if pm_core.any():
@@ -1306,34 +1597,50 @@ def evaluate_solution_quality(
     
     # Check member counts
     if joint_prob is not None:
-        n_joint_members = (joint_prob >= 0.9).sum()
+        n_joint_members = (joint_prob >= 0.8).sum()
         if n_joint_members < MIN_MEMBERS:
             quality_flags.append('LOW_JOINT_MEMBERS')
         
         member_fraction = n_joint_members / n_total
-        if member_fraction > 0.25:
+        if member_fraction > 0.35:
             quality_flags.append('HIGH_MEMBER_FRACTION')
     
-    # Check parameter reasonableness for successful models
+    # Check for reasonable parameter values
     if joint_result['status'] == 'SUCCESS':
+        joint_prob = joint_result['best']['prob']
         joint_center = joint_result['best']['center']
-        # Check for reasonable parallax values (0.1-10 mas typical for clusters)
-        if joint_center[2] < 0.1 or joint_center[2] > 10:
-            quality_flags.append('UNREASONABLE_PARALLAX')
         
-        # Check parallax spread
-        joint_cov = joint_result['best']['cov']
-        parallax_sigma = np.sqrt(joint_cov[2, 2])
-        if parallax_sigma > 2.0:  # Very broad parallax distribution
-            quality_flags.append('BROAD_PARALLAX')
+        # Check for over-admission of joint members
+        n_joint_core = (joint_prob >= 0.8).sum()
+        joint_core_fraction = n_joint_core / len(joint_prob)
+        
+        if joint_core_fraction > 0.35:
+            quality_flags.append("JOINT_OVERADMITTED_MEMBERS")
+            print(f"WARNING: Joint model over-admitted members ({n_joint_core}/{len(joint_prob)} = {joint_core_fraction:.2f}); do not trust joint_prob for this cluster.")
+        
+        # Check for reasonable parallax range
+        if len(joint_center) >= 3:
+            parallax_center = joint_center[2]
+            if parallax_center < 0.1 or parallax_center > 10.0:
+                quality_flags.append("JOINT_UNREASONABLE_PARALLAX")
+        
+        # Check for reasonable parallax spread (if covariance available)
+        if 'cov' in joint_result['best']:
+            joint_cov = joint_result['best']['cov']
+            if len(joint_cov) >= 3:
+                parallax_var = joint_cov[2, 2]
+                parallax_std = np.sqrt(max(parallax_var, 0))
+                if parallax_std > 2.0:  # Very spread out in parallax
+                    quality_flags.append("JOINT_WIDE_PARALLAX")
     
     # Check model agreement
     if all(prob is not None for prob in [pm_prob, plx_prob, joint_prob]):
         overlaps = compute_model_overlaps(pm_prob, plx_prob, joint_prob)
         
-        # PM-Parallax disagreement
-        if overlaps['pm_plx_overlap'] < OVERLAP_PM_PLX_MIN:
-            quality_flags.append('PM_PLX_DISAGREE')
+        # PM-Parallax overlap
+        if pm_prob is not None and plx_prob is not None:
+            if overlaps['pm_plx_overlap'] < OVERLAP_PM_PLX_MIN:
+                quality_flags.append('PM_PLX_DISAGREE')
         
         # Joint-PM disagreement
         if overlaps['joint_pm_overlap'] < OVERLAP_JOINT_PM_MIN:
@@ -1342,6 +1649,16 @@ def evaluate_solution_quality(
         # Joint-Parallax disagreement
         if overlaps['joint_plx_overlap'] < OVERLAP_JOINT_PLX_MIN:
             quality_flags.append('JOINT_PLX_DISAGREE')
+
+        # Hard reject: spatial-dominated joint solution with zero astrometric support
+        if joint_prob is not None:
+            joint_core_fraction = float((joint_prob >= 0.8).mean())
+            if (
+                joint_core_fraction > 0.35
+                and overlaps.get('joint_pm_overlap', np.nan) == 0
+                and overlaps.get('joint_plx_overlap', np.nan) == 0
+            ):
+                quality_flags.append("JOINT_SPATIAL_DOMINATED_REJECT")
     
     # Check seed stability
     def check_seed_stability(result_dict):
@@ -1430,7 +1747,7 @@ def validate_model_outputs(pm_result: dict, plx_result: dict, joint_result: dict
         
         # Check pi_cluster is reasonable
         pi_cluster = best['pi_cluster']
-        if not (MIN_PI <= pi_cluster <= MAX_PI):
+        if not (MIN_PI <= pi_cluster <= MAX_PI_HARD):
             validation_flags.append(f'{model_name}_INVALID_PI_CLUSTER')
     
     if validation_flags:
@@ -1444,21 +1761,30 @@ def generate_three_model_cmd_plot(
     df: pd.DataFrame,
     out_dir: Path,
     file_prefix: str,
+    apply_extinction_correction: bool = False,
 ):
     """
-    Generate three-panel CMD showing membership tiers for all three models:
-    PM-only, Parallax-only, and Joint 3D.
+    Generate three-panel CMD showing membership tiers for:
+    PM-only, Parallax-only, and Final astrometry-gated membership.
+    
+    Args:
+        df: DataFrame with photometry and membership data
+        out_dir: Output directory for plots
+        file_prefix: Prefix for output filenames
+        apply_extinction_correction: If True, apply spatial extinction correction
     """
     if not HAS_MATPLOTLIB:
         print("  (Skipped three-model CMD: matplotlib not available)")
         return
     
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    extinction_suffix = " (EXTINCTION CORRECTED)" if mag_col == "phot_g_mean_mag_corrected" else ""
     
     if mag_col not in df.columns or color_col not in df.columns:
         print("  (Skipped three-model CMD: missing photometry)")
         return
+
+    x_label, y_label, _ = cmd_axis_labels(mag_col, color_col)
     
     # Check for valid photometry
     valid_photo = df[mag_col].notna() & df[color_col].notna()
@@ -1472,13 +1798,13 @@ def generate_three_model_cmd_plot(
     # Colors for membership tiers
     tier_colors = {
         "core": "#117733",
-        "probable": "#332288",
-        "candidate": "#DDCC77",
+        "probable": "#2166AC",
+        "possible": "#D55E00",
         "non-member": "#888888",
     }
     
-    # Draw order: non-member first (bottom), then candidate, probable, core (top)
-    tier_order = ["non-member", "candidate", "probable", "core"]
+    # Draw order: non-member first (bottom), then possible, probable, core (top)
+    tier_order = ["non-member", "possible", "probable", "core"]
     
     # Panel 1: PM-only model
     ax = axes[0]
@@ -1496,16 +1822,16 @@ def generate_three_model_cmd_plot(
                     label=f"{tier_name} (N={count})",
                 )
         
-        n_pm_core = (df['pm_only_prob'] >= 0.9).sum() if 'pm_only_prob' in df.columns else 0
-        ax.set_title(f"PM-only Model\nCore members: {n_pm_core}")
+        n_pm_core = (df['pm_only_prob'] >= 0.8).sum() if 'pm_only_prob' in df.columns else 0
+        ax.set_title(f"PM-only Model{extinction_suffix}\nCore members: {n_pm_core}")
     else:
-        ax.text(0.5, 0.5, "PM-only model\nfailed", ha='center', va='center', transform=ax.transAxes)
+        ax.text(0.6, 0.6, "PM-only model\nfailed", ha='center', va='center', transform=ax.transAxes)
         ax.set_title("PM-only Model\nFAILED")
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP - RP")
-    ax.set_ylabel("G (mag)")
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=8)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.legend(loc="upper right", framealpha=0.8, fontsize=8)
     ax.set_aspect("auto")
     ax.grid(True, alpha=0.3)
     
@@ -1525,24 +1851,24 @@ def generate_three_model_cmd_plot(
                     label=f"{tier_name} (N={count})",
                 )
         
-        n_plx_core = (df['plx_only_prob'] >= 0.9).sum() if 'plx_only_prob' in df.columns else 0
-        ax.set_title(f"Parallax-only Model\nCore members: {n_plx_core}")
+        n_plx_core = (df['plx_only_prob'] >= 0.8).sum() if 'plx_only_prob' in df.columns else 0
+        ax.set_title(f"Parallax-only Model{extinction_suffix}\nCore members: {n_plx_core}")
     else:
-        ax.text(0.5, 0.5, "Parallax-only model\nfailed", ha='center', va='center', transform=ax.transAxes)
+        ax.text(0.6, 0.6, "Parallax-only model\nfailed", ha='center', va='center', transform=ax.transAxes)
         ax.set_title("Parallax-only Model\nFAILED")
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP - RP")
-    ax.set_ylabel("G (mag)")
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=8)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.legend(loc="upper right", framealpha=0.8, fontsize=8)
     ax.set_aspect("auto")
     ax.grid(True, alpha=0.3)
     
-    # Panel 3: Joint 3D model
+    # Panel 3: Final astrometry-gated membership (science output)
     ax = axes[2]
-    if 'joint_tier' in df.columns:
+    if 'final_tier' in df.columns:
         for tier_name in tier_order:
-            mask = valid_photo & (df['joint_tier'] == tier_name)
+            mask = valid_photo & (df['final_tier'] == tier_name)
             if mask.any():
                 count = mask.sum()
                 ax.scatter(
@@ -1554,16 +1880,16 @@ def generate_three_model_cmd_plot(
                     label=f"{tier_name} (N={count})",
                 )
         
-        n_joint_core = (df['joint_prob'] >= 0.9).sum() if 'joint_prob' in df.columns else 0
-        ax.set_title(f"Joint 3D Model\nCore members: {n_joint_core}")
+        n_final_core = (df['final_member_prob'] >= 0.8).sum() if 'final_member_prob' in df.columns else 0
+        ax.set_title(f"Final Membership (Astrometry-Gated){extinction_suffix}\nCore members: {n_final_core}")
     else:
-        ax.text(0.5, 0.5, "Joint 3D model\nfailed", ha='center', va='center', transform=ax.transAxes)
-        ax.set_title("Joint 3D Model\nFAILED")
+        ax.text(0.6, 0.6, "Final astrometry-gated\nmembership unavailable", ha='center', va='center', transform=ax.transAxes)
+        ax.set_title("Final Membership\nUNAVAILABLE")
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP - RP")
-    ax.set_ylabel("G (mag)")
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=8)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.legend(loc="upper right", framealpha=0.8, fontsize=8)
     ax.set_aspect("auto")
     ax.grid(True, alpha=0.3)
     
@@ -1581,6 +1907,9 @@ def generate_three_model_cmd_plot(
 
 
 
+
+
+
 def plot_cmd_colored_by_probability(
     df: pd.DataFrame,
     prob_values: np.ndarray,
@@ -1588,12 +1917,14 @@ def plot_cmd_colored_by_probability(
     out_dir: Path,
     filename: str,
     file_prefix: str,
+    apply_extinction_correction: bool = False,
 ):
-    """CMD (BP−RP vs G) colored by a continuous probability (plasma)."""
+    """CMD (BP−RP vs G) colored by a continuous probability (blue scale)."""
     if not HAS_MATPLOTLIB:
         return
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    
     if mag_col not in df.columns or color_col not in df.columns:
         return
     ok = df[mag_col].notna() & df[color_col].notna()
@@ -1605,15 +1936,15 @@ def plot_cmd_colored_by_probability(
         df.loc[ok, mag_col],
         c=prob_values[ok],
         s=8,
-        cmap="plasma",
+        cmap="Blues",
         alpha=0.7,
         vmin=0,
         vmax=1,
     )
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title(f"CMD — colored by {prob_label}")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD — colored by {prob_label}{title_suffix}")
     cbar = plt.colorbar(sc, ax=ax)
     cbar.set_label(prob_label)
     ax.set_aspect("auto")
@@ -1630,13 +1961,15 @@ def plot_cmd_core_only(
     out_dir: Path,
     filename: str,
     file_prefix: str,
-    threshold: float = 0.9,
+    threshold: float = 0.8,
+    apply_extinction_correction: bool = False,
 ):
-    """CMD showing only stars with probability ≥ threshold (e.g., 90% core members)."""
+    """CMD showing only stars with probability ≥ threshold (e.g., 80% core members)."""
     if not HAS_MATPLOTLIB:
         return
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    
     if mag_col not in df.columns or color_col not in df.columns:
         return
     
@@ -1654,12 +1987,12 @@ def plot_cmd_core_only(
         color="darkblue",
         alpha=0.8,
         edgecolors="black",
-        linewidths=0.5,
+        linewidths=0.6,
     )
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title(f"CMD — Core members only ({prob_label} ≥ {threshold})\nN = {ok.sum()}")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD — Core members only ({prob_label} ≥ {threshold}){title_suffix}\nN = {ok.sum()}")
     ax.set_aspect("auto")
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1668,113 +2001,13 @@ def plot_cmd_core_only(
     print(f"  Saved: {file_prefix}_{filename}")
 
 
-def plot_parallax_vs_pm_prob_scatter(df: pd.DataFrame, prob: np.ndarray, out_dir: Path, file_prefix: str):
-    """Parallax vs PM probability scatter plot"""
-    if not HAS_MATPLOTLIB:
-        return
-    
-    plx = df[PARALLAX_COL].values
-    valid = np.isfinite(plx)
-
-    if not valid.any():
-        print("  (Skipped parallax vs PM scatter: no valid parallax values)")
-        return
-
-    # --- Plot 1: Parallax vs PM probability, colored continuously by PM prob ---
-    fig, ax = plt.subplots(figsize=(9, 6))
-    order = np.argsort(prob[valid])  # plot low-prob first so high-prob on top
-    sc = ax.scatter(
-        plx[valid][order], prob[valid][order],
-        c=prob[valid][order], s=6, cmap="viridis", alpha=0.6, vmin=0, vmax=1,
-    )
-    ax.set_xlabel("Parallax (mas)")
-    ax.set_ylabel("PM membership probability")
-    ax.set_title("Parallax vs PM probability")
-    cbar = plt.colorbar(sc, ax=ax)
-    cbar.set_label("PM probability")
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_parallax_vs_pm_prob_scatter.png", dpi=150)
-    plt.close()
-    print(f"  Saved: {file_prefix}_parallax_vs_pm_prob_scatter.png")
 
 
-def plot_parallax_strip_by_tier(df: pd.DataFrame, prob: np.ndarray, out_dir: Path, file_prefix: str):
-    """Parallax strip plot by membership tier"""
-    if not HAS_MATPLOTLIB:
-        return
-    
-    plx = df[PARALLAX_COL].values
-    valid = np.isfinite(plx)
-
-    if not valid.any():
-        print("  (Skipped parallax strip by tier: no valid parallax values)")
-        return
-
-    # --- Plot 2: Parallax scatter by tier (subplots, jittered strip) ---
-    tier_defs = [
-        ("Core (P ≥ 0.9)", prob >= 0.9, "#117733"),
-        ("Probable (0.5–0.9)", (prob >= 0.5) & (prob < 0.9), "#332288"),
-        ("Candidate (0.2–0.5)", (prob >= 0.2) & (prob < 0.5), "#DDCC77"),
-        ("Field (P < 0.2)", prob < 0.2, "#888888"),
-    ]
-    fig, axes = plt.subplots(len(tier_defs), 1, figsize=(9, 2.8 * len(tier_defs)))
-    for i, (label, mask, color) in enumerate(tier_defs):
-        ax = axes[i]
-        m = mask & valid
-        n_stars = m.sum()
-        if n_stars > 0:
-            plx_tier = plx[m]
-            jitter = np.random.default_rng(42).normal(0, 0.15, size=n_stars)
-            ax.scatter(plx_tier, jitter, s=4, alpha=0.5, color=color, edgecolors="none")
-            ax.axvline(np.median(plx_tier), color="red", ls="--", lw=1.5,
-                       label=f"median = {np.median(plx_tier):.3f} mas")
-        ax.set_xlabel("Parallax (mas)")
-        ax.set_yticks([])
-        ax.set_title(f"{label} (N = {n_stars})")
-        ax.legend(loc="upper right")
-        ax.grid(True, axis="x", alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_parallax_strip_by_tier.png", dpi=150)
-    plt.close()
-    print(f"  Saved: {file_prefix}_parallax_strip_by_tier.png")
 
 
-def plot_parallax_vs_pm_prob_by_tier(df: pd.DataFrame, prob: np.ndarray, out_dir: Path, file_prefix: str):
-    """Parallax vs PM probability plot colored by tier"""
-    if not HAS_MATPLOTLIB:
-        return
-    
-    plx = df[PARALLAX_COL].values
-    valid = np.isfinite(plx)
 
-    if not valid.any():
-        print("  (Skipped parallax vs PM by tier: no valid parallax values)")
-        return
 
-    # --- Plot 3: All tiers overlaid on one parallax scatter ---
-    tier_defs = [
-        ("Core (P ≥ 0.9)", prob >= 0.9, "#117733"),
-        ("Probable (0.5–0.9)", (prob >= 0.5) & (prob < 0.9), "#332288"),
-        ("Candidate (0.2–0.5)", (prob >= 0.2) & (prob < 0.5), "#DDCC77"),
-        ("Field (P < 0.2)", prob < 0.2, "#888888"),
-    ]
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for label, mask, color in reversed(tier_defs):  # field first (bottom layer)
-        m = mask & valid
-        if m.sum() > 0:
-            ax.scatter(plx[m], prob[m], s=6, alpha=0.5, color=color,
-                       edgecolors="none", label=f"{label} (N={m.sum()})")
-    ax.set_xlabel("Parallax (mas)")
-    ax.set_ylabel("PM probability")
-    ax.set_title("Parallax vs PM probability — colored by tier")
-    ax.legend(loc="upper right", framealpha=0.9, markerscale=3)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_parallax_vs_pm_prob_by_tier.png", dpi=150)
-    plt.close()
-    print(f"  Saved: {file_prefix}_parallax_vs_pm_prob_by_tier.png")
+
 
 
 def plot_cmd_core_only_comparison(
@@ -1784,15 +2017,17 @@ def plot_cmd_core_only_comparison(
     bayesian_posterior: np.ndarray,
     out_dir: Path,
     file_prefix: str,
+    apply_extinction_correction: bool = False,
 ):
     """
-    3-panel CMD showing ONLY the 90%+ core group for PM, parallax, and combined
+    3-panel CMD showing ONLY the 80%+ core group for PM, parallax, and combined
     """
     if not HAS_MATPLOTLIB:
         return
     
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    
     if mag_col not in df.columns or color_col not in df.columns:
         print("  (Skipped CMD core-only: missing photometry)")
         return
@@ -1808,49 +2043,49 @@ def plot_cmd_core_only_comparison(
     
     # --- Panel 1: PM probability core only ---
     ax = axes[0]
-    mask_core = valid_photo & (pm_prob >= 0.9)
+    mask_core = valid_photo & (pm_prob >= 0.8)
     if mask_core.any():
         ax.scatter(df.loc[mask_core, color_col], df.loc[mask_core, mag_col],
                   s=12, color=color_core, alpha=0.8, edgecolors="black", 
-                  linewidths=0.5, label=f"Core (≥90%): N={mask_core.sum()}")
+                  linewidths=0.6, label=f"Core (≥80%): N={mask_core.sum()}")
         ax.legend()
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD by PM probability - Core only")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD by PM probability - Core only{title_suffix}")
     ax.grid(True, alpha=0.3)
     ax.set_aspect("auto")
     
     # --- Panel 2: Parallax probability core only ---
     ax = axes[1]
-    mask_core = valid_photo & (parallax_prob >= 0.9)
+    mask_core = valid_photo & (parallax_prob >= 0.8)
     if mask_core.any():
         ax.scatter(df.loc[mask_core, color_col], df.loc[mask_core, mag_col],
                   s=12, color=color_core, alpha=0.8, edgecolors="black",
-                  linewidths=0.5, label=f"Core (≥90%): N={mask_core.sum()}")
+                  linewidths=0.6, label=f"Core (≥80%): N={mask_core.sum()}")
         ax.legend()
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD by Parallax probability - Core only")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD by Parallax probability - Core only{title_suffix}")
     ax.grid(True, alpha=0.3)
     ax.set_aspect("auto")
     
     # --- Panel 3: Bayesian posterior core only ---
     ax = axes[2]
-    mask_core = valid_photo & (bayesian_posterior >= 0.9)
+    mask_core = valid_photo & (bayesian_posterior >= 0.8)
     if mask_core.any():
         ax.scatter(df.loc[mask_core, color_col], df.loc[mask_core, mag_col],
                   s=12, color=color_core, alpha=0.8, edgecolors="black",
-                  linewidths=0.5, label=f"Core (≥90%): N={mask_core.sum()}")
+                  linewidths=0.6, label=f"Core (≥80%): N={mask_core.sum()}")
         ax.legend()
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD by Combined probability - Core only")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD by Combined probability - Core only{title_suffix}")
     ax.grid(True, alpha=0.3)
     ax.set_aspect("auto")
     
@@ -1867,16 +2102,18 @@ def plot_cmd_comparison_cuts(
     bayesian_posterior: np.ndarray,
     out_dir: Path,
     file_prefix: str,
+    apply_extinction_correction: bool = False,
 ):
     """
     3-panel CMD comparing PM, parallax, and combined probabilities
-    with two confidence levels: 80-90% (light) and 90%+ (medium blue)
+    with two confidence levels: 60-80% (light) and 80%+ (medium blue)
     """
     if not HAS_MATPLOTLIB:
         return
     
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    
     if mag_col not in df.columns or color_col not in df.columns:
         print("  (Skipped CMD comparison cuts: missing photometry)")
         return
@@ -1890,14 +2127,14 @@ def plot_cmd_comparison_cuts(
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
     # Colors for confidence levels
-    color_80_90 = "lightblue"  # Light blue for 80-90%
-    color_90_plus = "mediumblue"  # Medium blue for 90%+
+    color_60_80 = "lightblue"  # Light blue for 60-80%
+    color_80_plus = "mediumblue"  # Medium blue for 80%+
     
     # --- Panel 1: PM probability ---
     ax = axes[0]
     for label, threshold_low, threshold_high, color in [
-        ("80-90%", 0.8, 0.9, color_80_90),
-        ("90%+", 0.9, 1.0, color_90_plus),
+        ("60-80%", 0.6, 0.8, color_60_80),
+        ("80%+", 0.8, 1.0, color_80_plus),
     ]:
         mask = valid_photo & (pm_prob >= threshold_low) & (pm_prob < threshold_high)
         if mask.any():
@@ -1906,9 +2143,9 @@ def plot_cmd_comparison_cuts(
                       linewidths=0.3, label=f"{label}: N={mask.sum()}")
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD by PM probability")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD by PM probability{title_suffix}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_aspect("auto")
@@ -1916,8 +2153,8 @@ def plot_cmd_comparison_cuts(
     # --- Panel 2: Parallax probability ---
     ax = axes[1]
     for label, threshold_low, threshold_high, color in [
-        ("80-90%", 0.8, 0.9, color_80_90),
-        ("90%+", 0.9, 1.0, color_90_plus),
+        ("60-80%", 0.6, 0.8, color_60_80),
+        ("80%+", 0.8, 1.0, color_80_plus),
     ]:
         mask = valid_photo & (parallax_prob >= threshold_low) & (parallax_prob < threshold_high)
         if mask.any():
@@ -1926,9 +2163,9 @@ def plot_cmd_comparison_cuts(
                       linewidths=0.3, label=f"{label}: N={mask.sum()}")
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD by Parallax probability")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD by Parallax probability{title_suffix}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_aspect("auto")
@@ -1936,8 +2173,8 @@ def plot_cmd_comparison_cuts(
     # --- Panel 3: Bayesian posterior ---
     ax = axes[2]
     for label, threshold_low, threshold_high, color in [
-        ("80-90%", 0.8, 0.9, color_80_90),
-        ("90%+", 0.9, 1.0, color_90_plus),
+        ("60-80%", 0.6, 0.8, color_60_80),
+        ("80%+", 0.8, 1.0, color_80_plus),
     ]:
         mask = valid_photo & (bayesian_posterior >= threshold_low) & (bayesian_posterior < threshold_high)
         if mask.any():
@@ -1946,9 +2183,9 @@ def plot_cmd_comparison_cuts(
                       linewidths=0.3, label=f"{label}: N={mask.sum()}")
     
     ax.invert_yaxis()
-    ax.set_xlabel("BP − RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD by Combined probability")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"CMD by Combined probability{title_suffix}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_aspect("auto")
@@ -1959,91 +2196,7 @@ def plot_cmd_comparison_cuts(
     print(f"  Saved: {file_prefix}_cmd_comparison_cuts.png")
 
 
-def plot_phase2_summary(
-    df: pd.DataFrame,
-    pm_prob: np.ndarray,
-    parallax_prob: np.ndarray,
-    bayesian_posterior: np.ndarray,
-    out_dir: Path,
-    file_prefix: str,
-):
-    """
-    Minimal Phase 2 plots:
-      1) Histogram overlay of PM_prob, Parallax_prob, Combined (Bayesian posterior)
-      2) CMD showing only 90%+ Bayesian posterior members
-      3) CMD comparison of cuts across probability types
-    """
-    if not HAS_MATPLOTLIB:
-        return
 
-    # --- Plot 1: Histogram overlay of all three probabilities (full range) ---
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # PM probability
-    ax.hist(pm_prob, bins=50, range=(0, 1), alpha=0.5, color="steelblue", 
-            label="PM probability", edgecolor="black", linewidth=0.5)
-    
-    # Parallax probability (standalone)
-    ax.hist(parallax_prob, bins=50, range=(0, 1), alpha=0.5, color="darkorange",
-            label="Parallax probability", edgecolor="black", linewidth=0.5)
-    
-    # Bayesian posterior (true combined)
-    ax.hist(bayesian_posterior, bins=50, range=(0, 1), alpha=0.5, color="crimson",
-            label="P(cluster | PM + parallax)", edgecolor="black", linewidth=0.5)
-    
-    ax.set_xlabel("Probability of membership")
-    ax.set_ylabel("Number of sources")
-    ax.set_title("Distribution of membership probabilities (full range)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_probability_distributions.png", dpi=150)
-    plt.close()
-    print(f"  Saved: {file_prefix}_probability_distributions.png")
-
-    # --- Plot 1b: Histogram overlay of 50%+ probabilities (zoomed) ---
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # PM probability (50%+ only)
-    mask_pm_50 = pm_prob >= 0.5
-    if mask_pm_50.any():
-        ax.hist(pm_prob[mask_pm_50], bins=40, range=(0.5, 1.0), alpha=0.5, color="steelblue", 
-                label="PM probability", edgecolor="black", linewidth=0.5)
-    
-    # Parallax probability (50%+ only)
-    mask_parallax_50 = parallax_prob >= 0.5
-    if mask_parallax_50.any():
-        ax.hist(parallax_prob[mask_parallax_50], bins=40, range=(0.5, 1.0), alpha=0.5, color="darkorange",
-                label="Parallax probability", edgecolor="black", linewidth=0.5)
-    
-    # Bayesian posterior (50%+ only)
-    mask_bayesian_50 = bayesian_posterior >= 0.5
-    if mask_bayesian_50.any():
-        ax.hist(bayesian_posterior[mask_bayesian_50], bins=40, range=(0.5, 1.0), alpha=0.5, color="crimson",
-                label="P(cluster | PM + parallax)", edgecolor="black", linewidth=0.5)
-    
-    ax.set_xlabel("Probability of membership")
-    ax.set_ylabel("Number of sources")
-    ax.set_title("Distribution of membership probabilities (50%+ only)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_probability_distributions_50plus.png", dpi=150)
-    plt.close()
-    print(f"  Saved: {file_prefix}_probability_distributions_50plus.png")
-
-    # --- Plot 2: CMD of 90%+ Bayesian posterior members ---
-    plot_cmd_core_only(
-        df, bayesian_posterior, "P(cluster | PM + parallax)", 
-        out_dir, "cmd_core_bayesian_only.png", file_prefix, threshold=0.9
-    )
-    
-    # --- Plot 3: Individual probability distributions ---
-    plot_individual_probabilities(pm_prob, parallax_prob, bayesian_posterior, out_dir, file_prefix)
-    
-    # --- Plot 4: CMD comparison of cuts ---
-    plot_cmd_core_only_comparison(df, pm_prob, parallax_prob, bayesian_posterior, out_dir, file_prefix)
-    plot_cmd_comparison_cuts(df, pm_prob, parallax_prob, bayesian_posterior, out_dir, file_prefix)
 
 
 def plot_individual_probabilities(
@@ -2063,7 +2216,7 @@ def plot_individual_probabilities(
     # PM probability
     ax = axes[0]
     ax.hist(pm_prob, bins=50, range=(0, 1), alpha=0.7, color="steelblue", 
-            edgecolor="black", linewidth=0.5)
+            edgecolor="black", linewidth=0.6)
     ax.set_xlabel("PM membership probability")
     ax.set_ylabel("Number of sources")
     ax.set_title("PM probability distribution")
@@ -2072,7 +2225,7 @@ def plot_individual_probabilities(
     # Parallax probability
     ax = axes[1]
     ax.hist(parallax_prob, bins=50, range=(0, 1), alpha=0.7, color="darkorange",
-            edgecolor="black", linewidth=0.5)
+            edgecolor="black", linewidth=0.6)
     ax.set_xlabel("Parallax membership probability")
     ax.set_ylabel("Number of sources")
     ax.set_title("Parallax probability distribution")
@@ -2081,7 +2234,7 @@ def plot_individual_probabilities(
     # Bayesian posterior
     ax = axes[2]
     ax.hist(bayesian_posterior, bins=50, range=(0, 1), alpha=0.7, color="crimson",
-            edgecolor="black", linewidth=0.5)
+            edgecolor="black", linewidth=0.6)
     ax.set_xlabel("P(cluster | PM + parallax)")
     ax.set_ylabel("Number of sources")
     ax.set_title("Combined probability distribution")
@@ -2100,7 +2253,7 @@ def plot_individual_probabilities(
     mask_pm_50 = pm_prob >= 0.5
     if mask_pm_50.any():
         ax.hist(pm_prob[mask_pm_50], bins=40, range=(0.5, 1.0), alpha=0.7, color="steelblue",
-                edgecolor="black", linewidth=0.5)
+                edgecolor="black", linewidth=0.6)
     ax.set_xlabel("PM membership probability")
     ax.set_ylabel("Number of sources")
     ax.set_title("PM probability distribution (50%+ only)")
@@ -2111,7 +2264,7 @@ def plot_individual_probabilities(
     mask_parallax_50 = parallax_prob >= 0.5
     if mask_parallax_50.any():
         ax.hist(parallax_prob[mask_parallax_50], bins=40, range=(0.5, 1.0), alpha=0.7, color="darkorange",
-                edgecolor="black", linewidth=0.5)
+                edgecolor="black", linewidth=0.6)
     ax.set_xlabel("Parallax membership probability")
     ax.set_ylabel("Number of sources")
     ax.set_title("Parallax probability distribution (50%+ only)")
@@ -2122,7 +2275,7 @@ def plot_individual_probabilities(
     mask_bayesian_50 = bayesian_posterior >= 0.5
     if mask_bayesian_50.any():
         ax.hist(bayesian_posterior[mask_bayesian_50], bins=40, range=(0.5, 1.0), alpha=0.7, color="crimson",
-                edgecolor="black", linewidth=0.5)
+                edgecolor="black", linewidth=0.6)
     ax.set_xlabel("P(cluster | PM + parallax)")
     ax.set_ylabel("Number of sources")
     ax.set_title("Combined probability distribution (50%+ only)")
@@ -2134,202 +2287,947 @@ def plot_individual_probabilities(
     print(f"  Saved: {file_prefix}_individual_probabilities_50plus.png")
 
 
-def plot_cmd_pm_only_variant(
+
+
+
+
+
+
+
+
+
+def robust_scatter(values: np.ndarray) -> float:
+    """Robust 1-sigma scatter estimate from MAD."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan
+    med = np.median(values)
+    return float(1.4826 * np.median(np.abs(values - med)))
+
+
+def cmd_axis_labels(mag_col: str, color_col: str) -> tuple[str, str, str]:
+    """Return CMD axis labels and title suffix matching raw/corrected photometry."""
+    corrected_cmd = mag_col == "phot_g_mean_mag_corrected" and color_col == "bp_rp_corrected"
+    if corrected_cmd:
+        return "BP − RP corrected", "G corrected (mag)", " (empirical extinction corrected)"
+    return "BP − RP", "G (mag)", ""
+
+
+def cmd_extinction_zoom_limits() -> tuple[float, float, float, float]:
+    """Return the fixed CMD diagnostic box as (color_min, color_max, mag_min, mag_max)."""
+    return (
+        CMD_EXTINCTION_BOX_COLOR_MIN,
+        CMD_EXTINCTION_BOX_COLOR_MAX,
+        CMD_EXTINCTION_BOX_MAG_MIN,
+        CMD_EXTINCTION_BOX_MAG_MAX,
+    )
+
+
+def add_cmd_extinction_zoom_box(ax) -> None:
+    """Draw the standardized extinction-analysis CMD zoom rectangle on an axis."""
+    color_min, color_max, mag_min, mag_max = cmd_extinction_zoom_limits()
+    rect = Rectangle(
+        (color_min, mag_min),
+        color_max - color_min,
+        mag_max - mag_min,
+        fill=False,
+        edgecolor="crimson",
+        linewidth=1.8,
+        linestyle="--",
+        alpha=0.95,
+        zorder=10,
+    )
+    ax.add_patch(rect)
+    ax.text(
+        color_min,
+        mag_min,
+        " fixed extinction\n zoom box",
+        color="crimson",
+        fontsize=8,
+        va="bottom",
+        ha="left",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.65, pad=1.5),
+        zorder=11,
+    )
+
+
+
+
+
+def select_cmd_photometry(
     df: pd.DataFrame,
-    pm_prob: np.ndarray,
+    apply_extinction_correction: bool = False,
+) -> tuple[str, str]:
+    """
+    Select CMD photometry columns for plotting without recomputing corrections.
+
+    Extinction-corrected CMD plots are allowed only when the one-time precompute
+    step has already added valid corrected columns to the result table.  Plotting
+    must not call compute_spatial_extinction_correction() itself, because a failed
+    precompute should fall back to raw photometry once rather than being retried by
+    every CMD plot.
+    """
+    corrected_cols = ["phot_g_mean_mag_corrected", "bp_rp_corrected"]
+    if apply_extinction_correction and all(col in df.columns for col in corrected_cols):
+        valid_corrected = (
+            df["phot_g_mean_mag_corrected"].notna()
+            & df["bp_rp_corrected"].notna()
+        )
+        # Legacy outputs can contain raw copies labeled as corrected. Do not
+        # advertise a corrected render variant when no correction was applied.
+        changed = (
+            (df["phot_g_mean_mag_corrected"] - df["phot_g_mean_mag"]).abs() > 1e-10
+        ) | ((df["bp_rp_corrected"] - df["bp_rp"]).abs() > 1e-10)
+        if (valid_corrected & changed).any():
+            return "phot_g_mean_mag_corrected", "bp_rp_corrected"
+
+    return "phot_g_mean_mag", "bp_rp"
+
+
+def has_precomputed_extinction_photometry(df: pd.DataFrame) -> bool:
+    """Return True only when valid corrected CMD columns are present in the table."""
+    return select_cmd_photometry(df, apply_extinction_correction=True) == (
+        "phot_g_mean_mag_corrected",
+        "bp_rp_corrected",
+    )
+
+
+def fallback_photometry_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Safely return raw CMD arrays, using NaNs when columns are unavailable."""
+    color = df["bp_rp"].values.astype(float) if "bp_rp" in df.columns else np.full(len(df), np.nan)
+    mag = df["phot_g_mean_mag"].values.astype(float) if "phot_g_mean_mag" in df.columns else np.full(len(df), np.nan)
+    return color, mag
+
+
+def compute_spatial_extinction_correction(
+    df: pd.DataFrame,
+    prob_col: str = "final_member_prob",
+    prob_threshold: float = CORE_MEMBER_PROB_THRESHOLD,
+    n_bins: int = 5,
+    smoothing_sigma: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Compute independent 2D spatial extinction corrections for both magnitude and color.
+    
+    Uses only high-probability core members (default: final_member_prob >= 0.8)
+    to map magnitude and color residuals across the field, then creates separate
+    smooth correction surfaces for each dimension.  The resulting correction
+    surfaces are still evaluated for every star so corrected CMD columns remain
+    available for the full table, but non-core stars never define the extinction
+    surface.
+    
+    Args:
+        df: DataFrame with photometry and coordinates
+        prob_col: Column name for membership probabilities used to define the
+            core reference group
+        prob_threshold: Minimum probability to use as reference stars; defaults
+            to 0.8 for the 80%+ core group
+        n_bins: Number of spatial bins for initial correction map
+        smoothing_sigma: Gaussian smoothing sigma (in bins) for correction surface
+    
+    Returns:
+        corrected_color: Array of corrected BP-RP colors
+        corrected_mag: Array of corrected G magnitudes  
+        correction_info: Dict with correction metrics and parameters
+    """
+    from scipy.ndimage import gaussian_filter
+    from scipy.interpolate import RegularGridInterpolator
+    
+    fallback_color, fallback_mag = fallback_photometry_arrays(df)
+
+    required = ["ra", "dec", "phot_g_mean_mag", "bp_rp"]
+    if any(col not in df.columns for col in required):
+        print("  (Spatial extinction correction: missing required columns)")
+        return fallback_color, fallback_mag, {
+            "success": False,
+            "reason": "missing_columns"
+        }
+
+    # If the pipeline already prepared corrected photometry, reuse it instead of
+    # recomputing a potentially slightly different smoothed correction surface in
+    # every plotting function.  This keeps all CMD outputs and the saved CSV
+    # internally consistent for a given run.
+    if "bp_rp_corrected" in df.columns and "phot_g_mean_mag_corrected" in df.columns:
+        corrected_color = df["bp_rp_corrected"].values.astype(float)
+        corrected_mag = df["phot_g_mean_mag_corrected"].values.astype(float)
+        if has_precomputed_extinction_photometry(df):
+            return corrected_color, corrected_mag, {
+                "success": True,
+                "reason": "precomputed_columns",
+                "prob_col": prob_col,
+                "prob_threshold": prob_threshold,
+                "n_reference_stars": int(df.get("extinction_reference_star", pd.Series(False, index=df.index)).sum())
+                if "extinction_reference_star" in df.columns else np.nan,
+                "median_correction_color": float(np.nanmedian(df["bp_rp"] - corrected_color)),
+                "median_correction_mag": float(np.nanmedian(df["phot_g_mean_mag"] - corrected_mag)),
+                "max_correction_color": float(np.nanmax(np.abs(df["bp_rp"] - corrected_color))),
+                "max_correction_mag": float(np.nanmax(np.abs(df["phot_g_mean_mag"] - corrected_mag))),
+            }
+    
+    g = df["phot_g_mean_mag"].values.astype(float)
+    color = df["bp_rp"].values.astype(float)
+    x, y, _, _ = add_projected_xy(df)
+    
+    # Use only the high-probability core group as the reference set for
+    # calculating the empirical extinction/differential-reddening surface.  Do
+    # not fall back to all stars here: all stars should receive the correction,
+    # but field stars should not define it.
+    if prob_col not in df.columns:
+        print(f"  (Spatial extinction correction: missing reference probability column '{prob_col}')")
+        return fallback_color, fallback_mag, {
+            "success": False,
+            "reason": "missing_probability_column",
+            "prob_col": prob_col,
+            "prob_threshold": prob_threshold,
+        }
+
+    prob_values = df[prob_col].values.astype(float)
+    finite_prob = np.isfinite(prob_values)
+    if not finite_prob.any():
+        print(f"  (Spatial extinction correction: no finite values in '{prob_col}')")
+        return fallback_color, fallback_mag, {
+            "success": False,
+            "reason": "invalid_probability_column",
+            "prob_col": prob_col,
+            "prob_threshold": prob_threshold,
+        }
+
+    membership_mask = finite_prob & (prob_values >= prob_threshold)
+    n_core_candidates = int(membership_mask.sum())
+    if n_core_candidates == 0:
+        print(
+            f"  (Spatial extinction correction: no core reference stars with "
+            f"{prob_col} >= {prob_threshold:.2f})"
+        )
+        return fallback_color, fallback_mag, {
+            "success": False,
+            "reason": "no_core_reference_stars",
+            "prob_col": prob_col,
+            "prob_threshold": prob_threshold,
+            "n_core_candidates": n_core_candidates,
+        }
+    
+    # Focus on main sequence stars for better reference
+    # Use stars with G > 14 to avoid bright giants, G < 18 for good photometry
+    ms_mask = (
+        np.isfinite(x) & np.isfinite(y) & np.isfinite(g) & np.isfinite(color)
+        & membership_mask
+        & (g > 14.0) & (g < 18.0)
+    )
+    
+    if ms_mask.sum() < 10:
+        print(
+            f"  (Spatial extinction correction: too few core reference stars after "
+            f"photometry cuts; {ms_mask.sum()} usable from {n_core_candidates} "
+            f"stars with {prob_col} >= {prob_threshold:.2f})"
+        )
+        return fallback_color, fallback_mag, {
+            "success": False,
+            "reason": "insufficient_reference_stars",
+            "reference_mask": ms_mask,
+            "n_reference_stars": int(ms_mask.sum()),
+            "n_core_candidates": n_core_candidates,
+            "prob_col": prob_col,
+            "prob_threshold": prob_threshold,
+        }
+    
+    xx = x[ms_mask]
+    yy = y[ms_mask]
+    cc = color[ms_mask]
+    gg = g[ms_mask]
+    
+    # Compute independent residuals for both color and magnitude
+    median_color = np.nanmedian(cc)
+    median_mag = np.nanmedian(gg)
+    delta_color = cc - median_color
+    delta_mag = gg - median_mag
+    
+    # Create spatial bins for correction maps
+    x_edges = np.linspace(np.nanmin(x), np.nanmax(x), n_bins + 1)
+    y_edges = np.linspace(np.nanmin(y), np.nanmax(y), n_bins + 1)
+    
+    # Bin both color and magnitude residuals independently
+    binned_delta_color = np.full((n_bins, n_bins), np.nan)
+    binned_delta_mag = np.full((n_bins, n_bins), np.nan)
+    binned_count = np.zeros((n_bins, n_bins), dtype=int)
+    
+    for ix in range(n_bins):
+        for iy in range(n_bins):
+            in_cell = (
+                (xx >= x_edges[ix]) & (xx <= x_edges[ix + 1])
+                & (yy >= y_edges[iy]) & (yy <= y_edges[iy + 1])
+            )
+            if in_cell.sum() >= 2:
+                binned_delta_color[iy, ix] = np.nanmedian(delta_color[in_cell])
+                binned_delta_mag[iy, ix] = np.nanmedian(delta_mag[in_cell])
+                binned_count[iy, ix] = int(in_cell.sum())
+    
+    # Check spatial coverage
+    finite_mask = np.isfinite(binned_delta_color) & np.isfinite(binned_delta_mag)
+    if finite_mask.sum() < 4:
+        print("  (Spatial extinction correction: insufficient spatial coverage)")
+        return fallback_color, fallback_mag, {
+            "success": False,
+            "reason": "insufficient_spatial_coverage",
+            "reference_mask": ms_mask,
+            "n_reference_stars": int(ms_mask.sum()),
+            "n_core_candidates": n_core_candidates,
+            "prob_col": prob_col,
+            "prob_threshold": prob_threshold,
+        }
+    
+    # Replace NaN with median for smoothing
+    delta_color_filled = binned_delta_color.copy()
+    delta_mag_filled = binned_delta_mag.copy()
+    delta_color_filled[~np.isfinite(binned_delta_color)] = np.nanmedian(binned_delta_color[finite_mask])
+    delta_mag_filled[~np.isfinite(binned_delta_mag)] = np.nanmedian(binned_delta_mag[finite_mask])
+    
+    # Apply Gaussian smoothing to both maps independently
+    delta_color_smoothed = gaussian_filter(delta_color_filled, sigma=smoothing_sigma)
+    delta_mag_smoothed = gaussian_filter(delta_mag_filled, sigma=smoothing_sigma)
+    
+    # Create interpolators for both correction fields
+    x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+    
+    interpolator_color = RegularGridInterpolator(
+        (y_centers, x_centers),
+        delta_color_smoothed,
+        method='linear',
+        bounds_error=False,
+        fill_value=0.0
+    )
+    
+    interpolator_mag = RegularGridInterpolator(
+        (y_centers, x_centers),
+        delta_mag_smoothed,
+        method='linear',
+        bounds_error=False,
+        fill_value=0.0
+    )
+    
+    # The grid is defined at bin CENTERS, but stars extend to bin EDGES.
+    # Hold the nearest boundary value outside the center grid instead of
+    # silently assigning zero to the outer half of every edge bin. Before the
+    # RA wrap fix, NGC 7789's huge artificial gap put every star outside this
+    # center grid, so both arrays were identically zero despite success=True.
+    points = np.column_stack([
+        np.clip(y, y_centers[0], y_centers[-1]),
+        np.clip(x, x_centers[0], x_centers[-1]),
+    ])
+    valid_position = np.isfinite(x) & np.isfinite(y)
+    correction_color = np.zeros(len(df), dtype=float)
+    correction_mag = np.zeros(len(df), dtype=float)
+    correction_color[valid_position] = interpolator_color(points[valid_position])
+    correction_mag[valid_position] = interpolator_mag(points[valid_position])
+    
+    corrected_color = color - correction_color
+    corrected_mag = g - correction_mag
+    
+    # Compute improvement metrics
+    original_color_scatter = robust_scatter(delta_color)
+    original_mag_scatter = robust_scatter(delta_mag)
+    corrected_color_residuals = corrected_color[ms_mask] - np.nanmedian(corrected_color[ms_mask])
+    corrected_mag_residuals = corrected_mag[ms_mask] - np.nanmedian(corrected_mag[ms_mask])
+    corrected_color_scatter = robust_scatter(corrected_color_residuals)
+    corrected_mag_scatter = robust_scatter(corrected_mag_residuals)
+    
+    color_improvement = original_color_scatter - corrected_color_scatter
+    mag_improvement = original_mag_scatter - corrected_mag_scatter
+    color_improvement_fraction = color_improvement / original_color_scatter if original_color_scatter > 0 else 0
+    mag_improvement_fraction = mag_improvement / original_mag_scatter if original_mag_scatter > 0 else 0
+
+    correction_info = {
+        "success": True,
+        "reference_selection": f"{prob_col} >= {prob_threshold:.2f}",
+        "prob_col": prob_col,
+        "prob_threshold": prob_threshold,
+        "n_core_candidates": n_core_candidates,
+        "n_bins": n_bins,
+        "smoothing_sigma": smoothing_sigma,
+        "n_reference_stars": int(ms_mask.sum()),
+        "reference_mask": ms_mask,
+        "original_color_scatter": original_color_scatter,
+        "corrected_color_scatter": corrected_color_scatter,
+        "original_mag_scatter": original_mag_scatter,
+        "corrected_mag_scatter": corrected_mag_scatter,
+        "color_scatter_improvement": color_improvement,
+        "mag_scatter_improvement": mag_improvement,
+        "color_improvement_fraction": color_improvement_fraction,
+        "mag_improvement_fraction": mag_improvement_fraction,
+        "median_correction_color": float(np.nanmedian(correction_color)),
+        "median_correction_mag": float(np.nanmedian(correction_mag)),
+        "max_correction_color": float(np.nanmax(np.abs(correction_color))),
+        "max_correction_mag": float(np.nanmax(np.abs(correction_mag))),
+        "n_stars_corrected": int(((np.abs(correction_color) > 1e-10)
+                                  | (np.abs(correction_mag) > 1e-10)).sum()),
+    }
+
+    if correction_info["n_stars_corrected"] == 0:
+        correction_info.update(success=False, reason="no_spatial_correction")
+        print("  (Spatial extinction correction: no nonzero correction available)")
+        return fallback_color, fallback_mag, correction_info
+
+    # Guard against using a smoothing surface that makes both CMD dimensions worse.
+    # Small negative fractions can happen from noise; require a meaningful worsening
+    # before rejecting the correction.
+    worsens_color = np.isfinite(color_improvement_fraction) and color_improvement_fraction < -0.02
+    worsens_mag = np.isfinite(mag_improvement_fraction) and mag_improvement_fraction < -0.02
+    if worsens_color and worsens_mag:
+        correction_info.update({
+            "success": False,
+            "reason": "scatter_worsened",
+        })
+        print("  (Spatial extinction correction rejected: both color and magnitude scatter worsened)")
+        print(f"    Color: scatter {original_color_scatter:.4f} → {corrected_color_scatter:.4f} ({color_improvement_fraction*100:.1f}%)")
+        print(f"    Mag:   scatter {original_mag_scatter:.4f} → {corrected_mag_scatter:.4f} ({mag_improvement_fraction*100:.1f}%)")
+        return fallback_color, fallback_mag, correction_info
+    
+    print(f"  Spatial extinction correction applied:")
+    print(f"    Color: scatter {original_color_scatter:.4f} → {corrected_color_scatter:.4f} ({color_improvement_fraction*100:.1f}%)")
+    print(f"    Mag:   scatter {original_mag_scatter:.4f} → {corrected_mag_scatter:.4f} ({mag_improvement_fraction*100:.1f}%)")
+    print(f"    Median corrections: color={correction_info['median_correction_color']:.4f}, mag={correction_info['median_correction_mag']:.4f}")
+    
+    return corrected_color, corrected_mag, correction_info
+
+
+def add_extinction_corrected_photometry(
+    df: pd.DataFrame,
+    prob_col: str = "final_member_prob",
+    prob_threshold: float = CORE_MEMBER_PROB_THRESHOLD,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Add empirical differential-reddening/photometric-flattening columns once.
+
+    The correction is intentionally saved as additional columns rather than
+    replacing Gaia observed photometry.  It is an empirical spatial CMD correction
+    for plotting/diagnostics, not an absolute extinction law correction using
+    external E(B-V), A_G, or Gaia passband coefficients.
+
+    Only the 80%+ core membership group (by default final_member_prob >= 0.8)
+    is used to define the correction surface.  The resulting correction is then
+    evaluated for every row so full-table CMD plots remain available.
+    """
+    corrected_color, corrected_mag, correction_info = compute_spatial_extinction_correction(
+        df, prob_col=prob_col, prob_threshold=prob_threshold
+    )
+    if not correction_info.get("success", False):
+        return df, correction_info
+
+    out = df.copy()
+    out["bp_rp_corrected"] = corrected_color
+    out["phot_g_mean_mag_corrected"] = corrected_mag
+    out["bp_rp_extinction_delta"] = out["bp_rp"].astype(float) - out["bp_rp_corrected"].astype(float)
+    out["phot_g_extinction_delta"] = out["phot_g_mean_mag"].astype(float) - out["phot_g_mean_mag_corrected"].astype(float)
+
+    reference_mask = correction_info.get("reference_mask")
+    if reference_mask is not None and len(reference_mask) == len(out):
+        out["extinction_reference_star"] = np.asarray(reference_mask, dtype=bool)
+    elif prob_col in out.columns:
+        out["extinction_reference_star"] = out[prob_col].astype(float) >= prob_threshold
+    else:
+        out["extinction_reference_star"] = False
+
+    correction_info["n_reference_stars"] = int(out["extinction_reference_star"].sum())
+    correction_info["reference_selection"] = f"{prob_col} >= {prob_threshold:.2f} plus CMD reference cuts"
+    correction_info["prob_col"] = prob_col
+    correction_info["prob_threshold"] = prob_threshold
+    correction_info.pop("reference_mask", None)
+
+    return out, correction_info
+
+
+def plot_differential_reddening_color_gradient_diagnostic(
+    df: pd.DataFrame,
     out_dir: Path,
     file_prefix: str,
+    prob_col: str = "final_member_prob",
 ):
     """
-    CMD sanity check - Proper Motion only variant.
-    Shows all stars colored by PM membership tier (core, probable, candidate, non-member).
+    QC diagnostic: map BP-RP color across the sky for stars with precise-enough
+    photometry (default G in 17--18). This does not alter membership selection.
     """
-    if not HAS_MATPLOTLIB:
-        return
-    
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
-    if mag_col not in df.columns or color_col not in df.columns:
-        print("  (Skipped CMD PM-only: missing photometry)")
-        return
-    
-    valid_photo = df[mag_col].notna() & df[color_col].notna()
-    if not valid_photo.any():
-        print("  (Skipped CMD PM-only: no valid photometry)")
-        return
-    
-    # Create membership tiers from PM probability
-    tier = np.full(len(pm_prob), "non-member", dtype=object)
-    tier[pm_prob >= 0.9] = "core"
-    tier[(pm_prob >= 0.5) & (pm_prob < 0.9)] = "probable"
-    tier[(pm_prob >= 0.2) & (pm_prob < 0.5)] = "candidate"
-    
-    # Draw order: non-member first (bottom), then candidate, probable, core (top)
-    tier_order = ["non-member", "candidate", "probable", "core"]
-    tier_colors = {
-        "core": "#117733",
-        "probable": "#332288", 
-        "candidate": "#DDCC77",
-        "non-member": "#888888",
+    empty_metrics = {
+        "color_gradient_delta": np.nan,
+        "color_gradient_residual_sigma": np.nan,
     }
-    
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for tier_name in tier_order:
-        mask = valid_photo & (tier == tier_name)
-        if mask.any():
-            count = mask.sum()
-            ax.scatter(
-                df.loc[mask, color_col],
-                df.loc[mask, mag_col],
-                c=tier_colors[tier_name],
-                s=6,
-                alpha=0.7,
-                label=f"{tier_name} (N={count})",
+    if not HAS_MATPLOTLIB:
+        return empty_metrics
+
+    required = ["ra", "dec", "phot_g_mean_mag", "bp_rp"]
+    if any(col not in df.columns for col in required):
+        print("  (Skipped color-gradient diagnostic: missing ra/dec/G/BP-RP columns)")
+        return empty_metrics
+
+    g = df["phot_g_mean_mag"].values.astype(float)
+    color = df["bp_rp"].values.astype(float)
+    x, y, _, _ = add_projected_xy(df)
+
+    # Use high-confidence final members when available; otherwise fall back to all stars.
+    if prob_col in df.columns and not df[prob_col].isna().all():
+        membership_mask = df[prob_col].values.astype(float) >= 0.8
+        membership_label = f"{prob_col} ≥ 0.8"
+    else:
+        membership_mask = np.ones(len(df), dtype=bool)
+        membership_label = "all valid stars"
+
+    precise = (
+        np.isfinite(x) & np.isfinite(y) & np.isfinite(g) & np.isfinite(color)
+        & (g > 17.0) & (g < 18.0) & membership_mask
+    )
+
+    if precise.sum() < 8:
+        # Relax only the magnitude window, not the membership criterion, so sparse
+        # clusters still produce a QC plot while remaining focused on bright stars.
+        precise = (
+            np.isfinite(x) & np.isfinite(y) & np.isfinite(g) & np.isfinite(color)
+            & (g > 16.5) & (g < 18.5) & membership_mask
+        )
+        mag_label = "16.5 < G < 18.5 (fallback)"
+    else:
+        mag_label = "17 < G < 18"
+
+    if precise.sum() < 5:
+        print("  (Skipped color-gradient diagnostic: too few stars in precise-photometry sample)")
+        return empty_metrics
+
+    xx = x[precise]
+    yy = y[precise]
+    cc = color[precise]
+    delta_color = cc - np.nanmedian(cc)
+    resid_scatter = robust_scatter(delta_color)
+
+    # Bin the field spatially and show the median color residual in each cell.
+    n_bins = 5 if len(cc) >= 40 else 4
+    x_edges = np.linspace(np.nanmin(xx), np.nanmax(xx), n_bins + 1)
+    y_edges = np.linspace(np.nanmin(yy), np.nanmax(yy), n_bins + 1)
+    binned_delta = np.full((n_bins, n_bins), np.nan)
+    binned_count = np.zeros((n_bins, n_bins), dtype=int)
+    for ix in range(n_bins):
+        for iy in range(n_bins):
+            in_cell = (
+                (xx >= x_edges[ix]) & (xx <= x_edges[ix + 1])
+                & (yy >= y_edges[iy]) & (yy <= y_edges[iy + 1])
             )
-    
-    ax.invert_yaxis()
-    ax.set_xlabel("BP - RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD Sanity Check - Proper Motion Only")
-    ax.legend(loc="upper right", framealpha=0.9)
-    ax.set_aspect("auto")
+            if in_cell.sum() >= 2:
+                binned_delta[iy, ix] = np.nanmedian(delta_color[in_cell])
+                binned_count[iy, ix] = int(in_cell.sum())
+
+    finite_bins = np.isfinite(binned_delta)
+    color_gradient_delta = (
+        float(np.nanmax(binned_delta[finite_bins]) - np.nanmin(binned_delta[finite_bins]))
+        if finite_bins.any() else np.nan
+    )
+
+    # Simple left/right split for the advisor's eyeball question.
+    left = xx < np.nanmedian(xx)
+    right = ~left
+    left_med = float(np.nanmedian(delta_color[left])) if left.any() else np.nan
+    right_med = float(np.nanmedian(delta_color[right])) if right.any() else np.nan
+
+    vmax = max(0.03, float(np.nanpercentile(np.abs(delta_color), 95)))
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.8))
+
+    ax = axes[0]
+    sc = ax.scatter(
+        xx, yy, c=delta_color, s=28, cmap="coolwarm", alpha=0.9,
+        edgecolors="none", vmin=-vmax, vmax=vmax
+    )
+    ax.set_xlabel("Projected X = ΔRA cos(Dec) [deg]")
+    ax.set_ylabel("Projected Y = ΔDec [deg]")
+    ax.set_title(f"Color residuals on sky\n{mag_label}, {membership_label}, N={len(cc)}")
+    ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.3)
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label("Δ(BP − RP) from slice median")
+
+    ax = axes[1]
+    im = ax.imshow(
+        binned_delta,
+        origin="lower",
+        extent=[x_edges.min(), x_edges.max(), y_edges.min(), y_edges.max()],
+        cmap="coolwarm",
+        aspect="auto", vmin=-vmax, vmax=vmax,
+    )
+    for ix in range(n_bins):
+        for iy in range(n_bins):
+            if binned_count[iy, ix] > 0:
+                ax.text(
+                    0.5 * (x_edges[ix] + x_edges[ix + 1]),
+                    0.5 * (y_edges[iy] + y_edges[iy + 1]),
+                    str(binned_count[iy, ix]),
+                    ha="center", va="center", fontsize=8, color="black",
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.5, edgecolor="none"),
+                )
+    ax.set_xlabel("Projected X [deg]")
+    ax.set_ylabel("Projected Y [deg]")
+    ax.set_title(
+        "Binned median color residual\n"
+        f"cell range≈{color_gradient_delta:.3f} mag; σ_rob={resid_scatter:.3f}"
+    )
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("median Δ(BP − RP)")
+
+    ax = axes[2]
+    bins = np.linspace(-vmax, vmax, 18)
+    if left.any():
+        ax.hist(delta_color[left], bins=bins, alpha=0.65, color="#4477AA", edgecolor="black",
+                label=f"left/X-low median={left_med:+.3f}")
+    if right.any():
+        ax.hist(delta_color[right], bins=bins, alpha=0.65, color="#CC6677", edgecolor="black",
+                label=f"right/X-high median={right_med:+.3f}")
+    ax.axvline(0, color="black", ls="--", lw=1)
+    ax.set_xlabel("Δ(BP − RP) from slice median")
+    ax.set_ylabel("Number of stars")
+    ax.set_title("Left/right color-residual comparison")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_cmd_sanity_check_pm_only.png", dpi=150)
+    plt.savefig(out_dir / f"{file_prefix}_qc_color_gradient_diagnostic.png", dpi=150)
     plt.close()
-    print(f"  Saved: {file_prefix}_cmd_sanity_check_pm_only.png")
+    print(f"  Saved: {file_prefix}_qc_color_gradient_diagnostic.png")
+    return {
+        "color_gradient_delta": color_gradient_delta,
+        "color_gradient_residual_sigma": resid_scatter,
+    }
 
 
-def plot_cmd_parallax_only_variant(
+def plot_blue_straggler_parallax_validation(
     df: pd.DataFrame,
-    parallax_prob: np.ndarray,
     out_dir: Path,
     file_prefix: str,
+    prob_col: str = "final_member_prob",
 ):
     """
-    CMD sanity check - Parallax only variant.
-    Shows all stars colored by parallax membership tier (core, probable, candidate, non-member).
-    """
-    if not HAS_MATPLOTLIB:
-        return
-    
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
-    if mag_col not in df.columns or color_col not in df.columns:
-        print("  (Skipped CMD parallax-only: missing photometry)")
-        return
-    
-    valid_photo = df[mag_col].notna() & df[color_col].notna()
-    if not valid_photo.any():
-        print("  (Skipped CMD parallax-only: no valid photometry)")
-        return
-    
-    # Create membership tiers from parallax probability
-    tier = np.full(len(parallax_prob), "non-member", dtype=object)
-    tier[parallax_prob >= 0.9] = "core"
-    tier[(parallax_prob >= 0.5) & (parallax_prob < 0.9)] = "probable"
-    tier[(parallax_prob >= 0.2) & (parallax_prob < 0.5)] = "candidate"
-    
-    # Draw order: non-member first (bottom), then candidate, probable, core (top)
-    tier_order = ["non-member", "candidate", "probable", "core"]
-    tier_colors = {
-        "core": "#117733",
-        "probable": "#332288",
-        "candidate": "#DDCC77",
-        "non-member": "#888888",
-    }
-    
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for tier_name in tier_order:
-        mask = valid_photo & (tier == tier_name)
-        if mask.any():
-            count = mask.sum()
-            ax.scatter(
-                df.loc[mask, color_col],
-                df.loc[mask, mag_col],
-                c=tier_colors[tier_name],
-                s=6,
-                alpha=0.7,
-                label=f"{tier_name} (N={count})",
-            )
-    
-    ax.invert_yaxis()
-    ax.set_xlabel("BP - RP")
-    ax.set_ylabel("G (mag)")
-    ax.set_title("CMD Sanity Check - Parallax Only")
-    ax.legend(loc="upper right", framealpha=0.9)
-    ax.set_aspect("auto")
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_cmd_sanity_check_parallax_only.png", dpi=150)
-    plt.close()
-    print(f"  Saved: {file_prefix}_cmd_sanity_check_parallax_only.png")
+    QC diagnostic comparing parallaxes for ridge-selected Blue Straggler-like
+    candidates and a post-selection Main Sequence ridge-strip comparison sample.
 
-
-def plot_cmd_combined_variant(
-    df: pd.DataFrame,
-    bayesian_posterior: np.ndarray,
-    out_dir: Path,
-    file_prefix: str,
-):
+    The BSS candidate geometry is derived from the full reliable, high-confidence
+    member CMD ridge.  The MS comparison sample is selected only after the
+    turnoff/BSS candidates are defined, as a ridge-centered strip below the
+    turnoff.  This does not alter membership selection.
     """
-    CMD sanity check - Combined variant.
-    Shows all stars colored by combined Bayesian posterior membership tier (core, probable, candidate, non-member).
-    """
-    if not HAS_MATPLOTLIB:
-        return
-    
-    mag_col = "phot_g_mean_mag"
-    color_col = "bp_rp"
-    if mag_col not in df.columns or color_col not in df.columns:
-        print("  (Skipped CMD combined: missing photometry)")
-        return
-    
-    valid_photo = df[mag_col].notna() & df[color_col].notna()
-    if not valid_photo.any():
-        print("  (Skipped CMD combined: no valid photometry)")
-        return
-    
-    # Create membership tiers from combined probability
-    tier = np.full(len(bayesian_posterior), "non-member", dtype=object)
-    tier[bayesian_posterior >= 0.9] = "core"
-    tier[(bayesian_posterior >= 0.5) & (bayesian_posterior < 0.9)] = "probable"
-    tier[(bayesian_posterior >= 0.2) & (bayesian_posterior < 0.5)] = "candidate"
-    
-    # Draw order: non-member first (bottom), then candidate, probable, core (top)
-    tier_order = ["non-member", "candidate", "probable", "core"]
-    tier_colors = {
-        "core": "#117733",
-        "probable": "#332288",
-        "candidate": "#DDCC77",
-        "non-member": "#888888",
+    empty_metrics = {
+        "N_BSS": 0,
+        "N_MS": 0,
+        "median_parallax_BSS": np.nan,
+        "median_parallax_MS": np.nan,
+        "delta_median_parallax": np.nan,
+        "robust_sigma_BSS": np.nan,
+        "robust_sigma_MS": np.nan,
     }
-    
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for tier_name in tier_order:
-        mask = valid_photo & (tier == tier_name)
-        if mask.any():
-            count = mask.sum()
-            ax.scatter(
-                df.loc[mask, color_col],
-                df.loc[mask, mag_col],
-                c=tier_colors[tier_name],
-                s=6,
-                alpha=0.7,
-                label=f"{tier_name} (N={count})",
-            )
-    
+    if not HAS_MATPLOTLIB:
+        return empty_metrics
+
+    required = ["phot_g_mean_mag", "bp_rp", PARALLAX_COL]
+    if any(col not in df.columns for col in required):
+        print("  (Skipped blue-straggler parallax validation: missing CMD/parallax columns)")
+        return empty_metrics
+
+    g = df["phot_g_mean_mag"].values.astype(float)
+    color = df["bp_rp"].values.astype(float)
+    plx = df[PARALLAX_COL].values.astype(float)
+    valid_cmd = np.isfinite(g) & np.isfinite(color)
+    valid_plx = np.isfinite(plx)
+    valid = valid_cmd & valid_plx
+
+    if prob_col in df.columns and not df[prob_col].isna().all():
+        member_mask = df[prob_col].values.astype(float) >= 0.8
+        member_label = f"{prob_col} ≥ 0.8"
+    else:
+        member_mask = np.ones(len(df), dtype=bool)
+        member_label = "all valid stars"
+
+    # Trace the ridge from the full reliable high-confidence member sequence,
+    # not from a bright/MS comparison band.  The 17<G<18 color-gradient slice is
+    # unrelated to this QA and must not constrain BSS/MS ridge tracing.
+    ridge_sample = valid_cmd & member_mask
+    if ridge_sample.sum() < 15:
+        print("  (Skipped blue-straggler parallax validation: too few member stars for ridge tracing)")
+        return empty_metrics
+
+    gm = g[ridge_sample]
+    cm = color[ridge_sample]
+
+    def smooth_series(values: np.ndarray) -> np.ndarray:
+        """Small dependency-free triangular smoothing for ridge colors."""
+        if len(values) < 3:
+            return values
+        kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+        if len(values) < len(kernel):
+            kernel = np.ones(3)
+        kernel /= kernel.sum()
+        pad = len(kernel) // 2
+        padded = np.pad(values, pad, mode="edge")
+        return np.convolve(padded, kernel, mode="valid")
+
+    def trace_cmd_ridge(g_values: np.ndarray, c_values: np.ndarray):
+        """
+        Trace the main-sequence ridge as median BP-RP in sliding G bins.
+
+        Bins are intentionally magnitude-based over the available high-confidence
+        CMD range; no pre-limited bright/MS comparison band is used.  The turnoff
+        is later derived from ridge morphology.
+        """
+        finite = np.isfinite(g_values) & np.isfinite(c_values)
+        if finite.sum() < 15:
+            return None
+        g_values = g_values[finite]
+        c_values = c_values[finite]
+
+        g_lo, g_hi = float(np.nanmin(g_values)), float(np.nanmax(g_values))
+        if not np.isfinite(g_lo) or not np.isfinite(g_hi) or g_hi <= g_lo:
+            return None
+
+        n_bins = int(np.clip(len(g_values) // 8, 8, 32))
+        edges = np.linspace(g_lo, g_hi, n_bins + 1)
+        ridge_g = []
+        ridge_c = []
+        min_bin_count = 3 if len(g_values) < 80 else 5
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            in_bin = (g_values >= lo) & (g_values < hi)
+            if hi == edges[-1]:
+                in_bin = (g_values >= lo) & (g_values <= hi)
+            if in_bin.sum() < min_bin_count:
+                continue
+            # Use the blue/central ridge rather than the red binary/evolved tail.
+            c_bin = c_values[in_bin]
+            ridge_g.append(0.5 * (lo + hi))
+            ridge_c.append(float(np.nanpercentile(c_bin, 45)))
+
+        if len(ridge_g) < 5:
+            return None
+
+        ridge_g = np.asarray(ridge_g, dtype=float)
+        ridge_c = smooth_series(np.asarray(ridge_c, dtype=float))
+        order = np.argsort(ridge_g)
+        return ridge_g[order], ridge_c[order]
+
+    ridge = trace_cmd_ridge(gm, cm)
+    if ridge is None:
+        print("  (Skipped blue-straggler parallax validation: could not trace CMD ridge)")
+        return empty_metrics
+
+    ridge_g, ridge_c = ridge
+
+    def estimate_turnoff_from_lower_ms(rg: np.ndarray, rc: np.ndarray) -> int:
+        """
+        Estimate turnoff as the brightest ridge point still consistent with the
+        lower/main-sequence trend, not as the bluest upper-ridge point.
+
+        The traced ridge is ordered from bright to faint (increasing G).  We use
+        the faint/lower portion to define the monotonic lower-MS color--magnitude
+        trend, then walk from the faint end toward brighter magnitudes until the
+        ridge departs from that trend in slope or residual.  This avoids using a
+        subgiant/turnoff hook blue extremum as the anchor in old open clusters.
+        """
+        n = len(rg)
+        if n < 5:
+            return int(np.argmin(rg))
+
+        slope = np.gradient(rc, rg)
+        lower_anchor = rg >= np.nanpercentile(rg, 55)
+        if lower_anchor.sum() < 4:
+            lower_anchor = rg >= np.nanmedian(rg)
+        if lower_anchor.sum() < 4:
+            lower_anchor = np.ones(n, dtype=bool)
+
+        lower_slope = float(np.nanmedian(slope[lower_anchor]))
+        if not np.isfinite(lower_slope):
+            lower_slope = 0.0
+
+        # Robust lower-MS trend and residual scale.
+        try:
+            fit_coeff = np.polyfit(rg[lower_anchor], rc[lower_anchor], deg=1)
+            trend_c = np.polyval(fit_coeff, rg)
+            lower_resid = rc[lower_anchor] - np.polyval(fit_coeff, rg[lower_anchor])
+            resid_sigma = robust_scatter(lower_resid)
+        except Exception:
+            trend_c = np.interp(rg, rg[lower_anchor], rc[lower_anchor])
+            resid_sigma = robust_scatter(rc[lower_anchor] - np.nanmedian(rc[lower_anchor]))
+
+        if not np.isfinite(resid_sigma) or resid_sigma <= 0:
+            resid_sigma = 0.04
+
+        # Consistency with the lower MS: the local ridge should keep the lower-MS
+        # redder-when-fainter slope and remain close to the lower-MS extrapolation.
+        slope_floor = max(0.01, 0.25 * lower_slope) if lower_slope > 0 else -0.02
+        resid_tol = max(0.08, 3.0 * resid_sigma)
+        consistent = (slope >= slope_floor) & (np.abs(rc - trend_c) <= resid_tol)
+
+        # The anchor portion defines the lower MS by construction.
+        consistent[lower_anchor] = True
+
+        # Walk from faint to bright and choose the brightest point in the
+        # contiguous lower-MS sequence.  Allow one isolated failed bin so noisy
+        # ridge bins do not prematurely terminate the sequence.
+        first_consistent_idx = n - 1
+        misses = 0
+        for idx in range(n - 1, -1, -1):
+            if consistent[idx]:
+                first_consistent_idx = idx
+                misses = 0
+            else:
+                misses += 1
+                if misses > 1:
+                    break
+
+        return int(first_consistent_idx)
+
+    # Turnoff proxy: brightest point where the full traced ridge is still
+    # consistent with the monotonic lower/main-sequence trend.  This explicitly
+    # avoids choosing the bluest point on the upper ridge/subgiant hook.
+    turnoff_idx = estimate_turnoff_from_lower_ms(ridge_g, ridge_c)
+    turnoff_mag = float(ridge_g[turnoff_idx])
+    turnoff_color = float(ridge_c[turnoff_idx])
+
+    # For stars brighter than the first ridge bin, compare against the turnoff
+    # color rather than rejecting them for being outside the interpolation range.
+    # Fainter than the traced ridge remains invalid for ridge-strip comparisons.
+    ridge_color_at_star = np.interp(g, ridge_g, ridge_c, left=turnoff_color, right=np.nan)
+    color_resid = color - ridge_color_at_star
+    ridge_valid = np.isfinite(ridge_color_at_star)
+
+    # Estimate ridge width from stars below the turnoff; use conservative floors
+    # so sparse clusters still get usable geometric regions.
+    ms_width_sample = (
+        ridge_sample & ridge_valid
+        & (g >= turnoff_mag + 0.35)
+        & (g <= min(turnoff_mag + 2.4, float(np.nanmax(ridge_g))))
+    )
+    if ms_width_sample.sum() >= 8:
+        ridge_sigma = robust_scatter(color_resid[ms_width_sample])
+    else:
+        ridge_sigma = robust_scatter(color_resid[ridge_sample & ridge_valid])
+    if not np.isfinite(ridge_sigma) or ridge_sigma <= 0:
+        ridge_sigma = 0.08
+    ridge_sigma = float(np.clip(ridge_sigma, 0.06, 0.18))
+
+    # Blue Straggler-like QA sample: existing high-confidence members that are
+    # brighter than the morphology-derived turnoff and blueward of the local
+    # turnoff/main-sequence geometry.  No rectangular classifier/box is used.
+    bss_red_boundary = np.minimum(ridge_color_at_star, turnoff_color) - 0.35 * ridge_sigma
+
+    bs_mask = (
+        valid & member_mask & ridge_valid
+        & (g < turnoff_mag)
+        & (color < bss_red_boundary)
+    )
+
+    # Only after defining BSS candidates, select the MS comparison stars as a
+    # ridge-centered strip below the turnoff across the traced reliable ridge.
+    # There is deliberately no hard 17<G<18, 18.5-mag, or preset bright-band cap;
+    # any faint/reliability limit should enter through the available parallax data
+    # rather than clipping the CMD comparison geometry plotted here.
+    ms_g_min = turnoff_mag + 0.35
+    ms_g_max = float(np.nanmax(ridge_g))
+    ms_blue_offset = -1.25 * ridge_sigma
+    ms_red_offset = 1.75 * ridge_sigma
+
+    ms_mask = (
+        valid & member_mask & ridge_valid
+        & (g >= ms_g_min) & (g <= ms_g_max)
+        & (color_resid >= ms_blue_offset) & (color_resid <= ms_red_offset)
+    )
+
+    if bs_mask.sum() == 0 or ms_mask.sum() < 3:
+        print("  (Skipped blue-straggler parallax validation: insufficient BS/MS comparison stars)")
+        return empty_metrics
+
+    bs_plx = plx[bs_mask]
+    ms_plx = plx[ms_mask]
+
+    def stats_text(values):
+        return (
+            f"N={len(values)}\n"
+            f"median={np.median(values):.3f} mas\n"
+            f"std={np.std(values, ddof=1) if len(values) > 1 else np.nan:.3f} mas\n"
+            f"robust σ={robust_scatter(values):.3f} mas"
+        )
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.8))
+
+    ax = axes[0]
+    ax.scatter(color[valid_cmd], g[valid_cmd], s=5, c="#D0D0D0", alpha=0.25, label="all valid CMD stars")
+    ax.scatter(color[valid_cmd & member_mask], g[valid_cmd & member_mask], s=8, c="#8F8F8F", alpha=0.45,
+               label=member_label)
+    ax.scatter(color[ms_mask], g[ms_mask], s=30, c="#117733", alpha=0.9, edgecolors="black", linewidths=0.4,
+               label=f"MS ridge-strip comparison (N={ms_mask.sum()})")
+    ax.scatter(color[bs_mask], g[bs_mask], s=36, c="#4477AA", alpha=0.95, edgecolors="black", linewidths=0.5,
+               label=f"Blue Straggler candidates (N={bs_mask.sum()})")
+    ax.plot(ridge_c, ridge_g, color="black", lw=2.0, label="traced CMD ridge")
+    ax.scatter([turnoff_color], [turnoff_mag], marker="*", s=170, c="#CC6677",
+               edgecolors="black", linewidths=0.6, zorder=6, label="ridge turnoff proxy")
+
+    ms_line_g = np.linspace(ms_g_min, ms_g_max, 120)
+    ms_line_c = np.interp(ms_line_g, ridge_g, ridge_c)
+    ax.plot(ms_line_c + ms_blue_offset, ms_line_g, color="#117733", lw=2, ls="--",
+            label="MS ridge strip")
+    ax.plot(ms_line_c + ms_red_offset, ms_line_g, color="#117733", lw=2, ls="--")
+    ax.fill_betweenx(ms_line_g, ms_line_c + ms_blue_offset, ms_line_c + ms_red_offset,
+                     color="#117733", alpha=0.10)
+    ax.axhline(turnoff_mag, color="#CC6677", lw=1.2, ls=":", alpha=0.9)
     ax.invert_yaxis()
-    ax.set_xlabel("BP - RP")
+    ax.set_xlabel("BP − RP")
     ax.set_ylabel("G (mag)")
-    ax.set_title("CMD Sanity Check - Combined PM + Parallax")
-    ax.legend(loc="upper right", framealpha=0.9)
-    ax.set_aspect("auto")
+    ax.set_title(
+        "Ridge-derived turnoff-relative CMD validation regions\n"
+        f"turnoff≈({turnoff_color:.2f}, G={turnoff_mag:.2f}), ridge σ≈{ridge_sigma:.2f}"
+    )
+    ax.legend(loc="best", framealpha=0.85, fontsize=8)
     ax.grid(True, alpha=0.3)
+
+    all_plx = np.concatenate([bs_plx, ms_plx])
+    lo, hi = np.nanpercentile(all_plx, [1, 99])
+    pad = max(0.02, 0.15 * (hi - lo))
+    bins = np.linspace(lo - pad, hi + pad, 20)
+
+    for ax, values, title, color_name in [
+        (axes[1], bs_plx, "Blue Straggler candidate parallaxes", "#4477AA"),
+        (axes[2], ms_plx, "MS ridge-strip comparison parallaxes", "#117733"),
+    ]:
+        ax.hist(values, bins=bins, color=color_name, alpha=0.7, edgecolor="black", density=False)
+        ax.axvline(np.median(values), color="crimson", ls="--", lw=1.8, label="median")
+        if len(values) >= 3:
+            try:
+                kde = gaussian_kde(values)
+                grid = np.linspace(bins.min(), bins.max(), 200)
+                bin_width = bins[1] - bins[0]
+                ax.plot(grid, kde(grid) * len(values) * bin_width, color="black", lw=1.5, label="KDE")
+            except Exception:
+                pass
+        ax.text(0.03, 0.97, stats_text(values), ha="left", va="top", transform=ax.transAxes,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.85), fontsize=9)
+        ax.set_xlabel("Parallax (mas)")
+        ax.set_ylabel("Number of sources")
+        ax.set_title(title)
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    median_diff = np.median(bs_plx) - np.median(ms_plx)
+    fig.suptitle(
+        f"{file_prefix} QC: Blue Straggler vs Main Sequence parallax validation "
+        f"(median Δ={median_diff:+.3f} mas)",
+        y=1.02,
+    )
     plt.tight_layout()
-    plt.savefig(out_dir / f"{file_prefix}_cmd_sanity_check_combined.png", dpi=150)
+    plt.savefig(out_dir / f"{file_prefix}_qc_blue_straggler_parallax_validation.png", dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Saved: {file_prefix}_cmd_sanity_check_combined.png")
+    print(f"  Saved: {file_prefix}_qc_blue_straggler_parallax_validation.png")
+    return {
+        "N_BSS": int(bs_mask.sum()),
+        "N_MS": int(ms_mask.sum()),
+        "median_parallax_BSS": float(np.median(bs_plx)),
+        "median_parallax_MS": float(np.median(ms_plx)),
+        "delta_median_parallax": float(median_diff),
+        "robust_sigma_BSS": robust_scatter(bs_plx),
+        "robust_sigma_MS": robust_scatter(ms_plx),
+    }
 
 
 def perform_quadrature_analysis(df: pd.DataFrame, out_dir: Path, file_prefix: str) -> np.ndarray:
@@ -2405,9 +3303,9 @@ def run_spatial_astrometric_model(
     
     # Initialize cluster parameters
     sigma_pm = estimate_sigma_from_core(pm_data, np.median(pm_data, axis=0))
-    sigma_plx = max(0.05, 0.5 * np.std(parallax_data))
-    sigma_x = max(0.02, 0.25 * np.std(x_sky))
-    sigma_y = max(0.02, 0.25 * np.std(y_sky))
+    sigma_plx = max(0.05, 0.6 * np.std(parallax_data))
+    sigma_x = max(0.02, 0.35 * np.std(x_sky))
+    sigma_y = max(0.02, 0.35 * np.std(y_sky))
     
     # Initial cluster center (use medians)
     center_init = np.array([
@@ -2437,7 +3335,7 @@ def run_spatial_astrometric_model(
     result_df = df.copy()
     result_df['spatial_astrometric_prob'] = prob
     result_df['spatial_astrometric_tier'] = pd.cut(
-        prob, bins=[0, 0.1, 0.5, 0.9, 1.0], 
+        prob, bins=[0, 0.1, 0.6, 0.8, 1.0], 
         labels=['FIELD', 'POSSIBLE', 'LIKELY', 'CORE']
     )
     
@@ -2463,6 +3361,9 @@ def run_three_model_analysis(
     df: pd.DataFrame = None,
     out_dir: Path = None,
     file_prefix: str = None,
+    c_low: float = None,
+    c_high: float = None,
+    spatial_weight_override: float = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Run complete three-model analysis: PM-only, parallax-only, and joint 3D.
@@ -2475,6 +3376,10 @@ def run_three_model_analysis(
     
     # Fixed field component (same for all models)
     center_field_pm, cov_field_pm = fixed_field_component(pm_data)
+
+    # Adaptive per-cluster pi ceiling to avoid hard saturation at global MAX_PI
+    max_pi_adaptive = estimate_adaptive_max_pi(pm_data)
+    print(f"Adaptive max_pi: {max_pi_adaptive:.3f}")
     
     # Create proper 3D field component for joint model
     joint_data = np.column_stack([pm_data, parallax_data])
@@ -2482,17 +3387,51 @@ def run_three_model_analysis(
     
     # Run PM-only model
     print("Running PM-only model...")
-    pm_result = run_multi_seed_pm(pm_data, pmra_errors, pmdec_errors, center_field_pm, cov_field_pm)
+    pm_result = run_multi_seed_pm(
+        pm_data, pmra_errors, pmdec_errors, center_field_pm, cov_field_pm,
+        min_pi=MIN_PI, max_pi=max_pi_adaptive,
+    )
     
     # Run parallax-only model
     print("Running parallax-only model...")
-    plx_result = run_multi_seed_parallax(parallax_data, parallax_errors)
+    plx_result = run_multi_seed_parallax(
+        parallax_data, parallax_errors,
+        min_pi=MIN_PI, max_pi=max_pi_adaptive,
+    )
     
+    # Build astrometric support probability (PM-primary, parallax-penalty).
+    # PM drives membership; parallax only downweights strong disagreements.
+    # This keeps spatial from creating core membership by itself while avoiding
+    # over-suppression from conservative parallax-only fits.
+    astro_prob = None
+    if pm_result['status'] == 'SUCCESS' and plx_result['status'] == 'SUCCESS':
+        pm_prob = np.clip(pm_result['best']['prob'], 0, 1)
+        plx_prob = np.clip(plx_result['best']['prob'], 0, 1)
+        astro_prob = pm_prob.copy()
+        bad_plx = plx_prob < 0.2
+        astro_prob[bad_plx] *= 0.5
+
     # Run 5D spatial+astrometric model
     print("Running Joint 5D Spatial+Astrometric Model...")
     joint_result = run_multi_seed_joint(
-        pm_data, parallax_data, df
+        pm_data, parallax_data, df,
+        pmra_errors=pmra_errors, pmdec_errors=pmdec_errors, parallax_errors=parallax_errors,
+        center_field=None, cov_field=None,
+        astro_prob=astro_prob,
+        c_low=c_low,
+        c_high=c_high,
+        spatial_weight_override=spatial_weight_override,
+        min_pi=MIN_PI,
+        max_pi=max_pi_adaptive,
     )
+
+    # Save calibration diagnostics
+    if astro_prob is not None:
+        quality_summary_concentration = compute_spatial_concentration(
+            *add_projected_xy(df)[:2], astro_prob
+        )
+    else:
+        quality_summary_concentration = np.nan
     
     # Validate outputs
     if not validate_model_outputs(pm_result, plx_result, joint_result):
@@ -2500,6 +3439,10 @@ def run_three_model_analysis(
     
     # Quality assessment
     quality_summary = evaluate_solution_quality(pm_result, plx_result, joint_result, len(df))
+    quality_summary['max_pi_adaptive'] = max_pi_adaptive
+    quality_summary['spatial_concentration'] = quality_summary_concentration
+    quality_summary['spatial_c_low'] = c_low
+    quality_summary['spatial_c_high'] = c_high
     
     # Prepare results DataFrame
     result_df = df.copy()
@@ -2532,45 +3475,74 @@ def run_three_model_analysis(
         result_df['plx_only_center'] = np.nan
         result_df['plx_only_sigma'] = np.nan
     
-    # Add joint 3D results
+    # Add joint 5D results
     if joint_result['status'] == 'SUCCESS':
-        result_df['joint_prob'] = joint_result['best']['prob']
+        result_df['joint_5d_prob'] = joint_result['best']['prob']
+        result_df['joint_prob'] = joint_result['best']['prob']  # backward-compatible alias
         result_df['joint_tier'] = membership_tier(joint_result['best']['prob'])
         result_df['joint_pi'] = joint_result['best']['pi_cluster']
         result_df['joint_center_pmra'] = joint_result['best']['center'][0]
         result_df['joint_center_pmdec'] = joint_result['best']['center'][1]
         result_df['joint_center_parallax'] = joint_result['best']['center'][2]
     else:
+        result_df['joint_5d_prob'] = np.nan
         result_df['joint_prob'] = np.nan
         result_df['joint_tier'] = 'non-member'
         result_df['joint_pi'] = np.nan
         result_df['joint_center_pmra'] = np.nan
         result_df['joint_center_pmdec'] = np.nan
         result_df['joint_center_parallax'] = np.nan
+
+    # Add explicit astrometric 3D probability output
+    if astro_prob is not None:
+        result_df['astro_3d_prob'] = astro_prob
+    else:
+        result_df['astro_3d_prob'] = np.nan
     
     # Add quality flags
     result_df['quality_flags'] = ', '.join(quality_summary['quality_flags'])
+
+    # Final astrometry-gated membership probability.
+    # Joint 5D may refine membership, but cannot rescue stars with poor astrometric support.
+    result_df['final_prob'] = result_df['joint_5d_prob'].copy()
+    bad_joint = (
+        (result_df['joint_5d_prob'] >= 0.8)
+        & (result_df['astro_3d_prob'] < 0.5)
+    )
+    result_df.loc[bad_joint, 'final_prob'] = np.minimum(
+        result_df.loc[bad_joint, 'final_prob'],
+        result_df.loc[bad_joint, 'astro_3d_prob']
+    )
+
+    # Backward-compatible alias + final tiering for science/member lists
+    result_df['final_member_prob'] = result_df['final_prob']
+    result_df['final_tier'] = membership_tier(result_df['final_prob'].fillna(0).values)
     
     # Print summary
     print(f"\nModel Results Summary:")
     print(f"  PM-only: {pm_result['status']}")
     if pm_result['status'] == 'SUCCESS':
-        n_pm_core = (pm_result['best']['prob'] >= 0.9).sum()
+        n_pm_core = (pm_result['best']['prob'] >= 0.8).sum()
         print(f"    Core members: {n_pm_core}")
         print(f"    π_cluster: {pm_result['best']['pi_cluster']:.3f}")
     
     print(f"  Parallax-only: {plx_result['status']}")
     if plx_result['status'] == 'SUCCESS':
-        n_plx_core = (plx_result['best']['prob'] >= 0.9).sum()
+        n_plx_core = (plx_result['best']['prob'] >= 0.8).sum()
         print(f"    Core members: {n_plx_core}")
         print(f"    π_cluster: {plx_result['best']['pi_cluster']:.3f}")
     
-    print(f"  Joint 3D: {joint_result['status']}")
+    print(f"  Joint 5D: {joint_result['status']}")
     if joint_result['status'] == 'SUCCESS':
-        n_joint_core = (joint_result['best']['prob'] >= 0.9).sum()
+        n_joint_core = (joint_result['best']['prob'] >= 0.8).sum()
         print(f"    Core members: {n_joint_core}")
         print(f"    π_cluster: {joint_result['best']['pi_cluster']:.3f}")
         print(f"    Center (pmra, pmdec, parallax): {joint_result['best']['center']}")
+
+    if 'final_prob' in result_df.columns:
+        n_final_core = int((result_df['final_prob'] >= 0.8).sum())
+        print(f"  Final (astrometry-gated):")
+        print(f"    Core members: {n_final_core}")
     
     print(f"\nQuality Assessment: {quality_summary['overall_status']}")
     if quality_summary['quality_flags']:
@@ -2588,85 +3560,354 @@ def run_three_model_analysis(
 
 
 
-def generate_all_plots(result_df, out_dir, file_prefix):
-    """Dedicated plotting orchestrator - generates all available plots"""
-    if not HAS_MATPLOTLIB:
+def make_plot_output_dirs(out_dir: Path, include_extinction: bool = False) -> dict:
+    """Create and return standardized plot render-target directories."""
+    plot_root = out_dir / "plots"
+    plot_dirs = {
+        "png": plot_root / "png",
+        "html": plot_root / "html",
+    }
+    if include_extinction:
+        plot_dirs["png_with_extinction"] = plot_root / "png_with_extinction"
+        plot_dirs["html_with_extinction"] = plot_root / "html_with_extinction"
+
+    for path in plot_dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return plot_dirs
+
+
+def plotly_hover_columns(df: pd.DataFrame) -> list[str]:
+    """Return useful per-star columns to include in interactive hover tooltips."""
+    candidates = [
+        "source_id", "ra", "dec", "pmra", "pmdec", PARALLAX_COL,
+        "pm_only_prob", "plx_only_prob", "joint_prob", "final_member_prob",
+        "pm_only_tier", "plx_only_tier", "joint_tier", "final_tier",
+        "phot_g_mean_mag", "bp_rp",
+        "phot_g_mean_mag_corrected", "bp_rp_corrected",
+    ]
+    return [col for col in candidates if col in df.columns]
+
+
+def save_interactive_cmd_probability(
+    df: pd.DataFrame,
+    prob_values: np.ndarray,
+    prob_label: str,
+    out_dir: Path,
+    filename: str,
+    file_prefix: str,
+    apply_extinction_correction: bool = False,
+    threshold: float = None,
+):
+    """Save a zoomable Plotly CMD colored by probability."""
+    if not HAS_PLOTLY:
         return
 
-    has_pm = "pm_only_prob" in result_df.columns and not np.isnan(result_df["pm_only_prob"]).all()
-    has_plx = "plx_only_prob" in result_df.columns and not np.isnan(result_df["plx_only_prob"]).all()
-    has_joint = "joint_prob" in result_df.columns and not np.isnan(result_df["joint_prob"]).all()
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    if mag_col not in df.columns or color_col not in df.columns:
+        return
 
-    # Always generate model comparison CMD if possible
-    generate_three_model_cmd_plot(result_df, out_dir, file_prefix)
+    plot_df = df.copy()
+    plot_df[prob_label] = prob_values
+    ok = plot_df[mag_col].notna() & plot_df[color_col].notna() & np.isfinite(prob_values)
+    if threshold is not None:
+        ok &= prob_values >= threshold
+    plot_df = plot_df.loc[ok].copy()
+    if plot_df.empty:
+        return
 
+    fig = px.scatter(
+        plot_df,
+        x=color_col,
+        y=mag_col,
+        color=prob_label,
+        color_continuous_scale="Blues",
+        range_color=[0, 1],
+        hover_data=plotly_hover_columns(plot_df),
+        title=f"CMD — {prob_label}{title_suffix}" + (f" (≥ {threshold})" if threshold is not None else ""),
+        labels={color_col: x_label, mag_col: y_label},
+    )
+    fig.update_traces(marker=dict(size=5, opacity=0.75))
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(template="plotly_white", height=720)
+    output_name = Path(filename).with_suffix(".html").name
+    fig.write_html(out_dir / f"{file_prefix}_{output_name}", include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_{output_name}")
+
+
+
+
+
+
+
+
+def plotly_output_path(out_dir: Path, file_prefix: str, stem: str) -> Path:
+    """Standardize interactive HTML output filenames."""
+    return out_dir / f"{file_prefix}_{stem}.html"
+
+
+def plotly_tier_style() -> tuple[list[str], dict[str, str]]:
+    """Shared tier draw order and colors for Plotly CMD plots."""
+    tier_order = ["non-member", "possible", "probable", "core"]
+    tier_colors = {
+        "core": "#117733",
+        "probable": "#2166AC",
+        "possible": "#D55E00",
+        "non-member": "#888888",
+    }
+    return tier_order, tier_colors
+
+
+def add_cmd_tier_traces(
+    fig,
+    df: pd.DataFrame,
+    tier_values,
+    mag_col: str,
+    color_col: str,
+    row: int,
+    col: int,
+    showlegend: bool = True,
+):
+    """Add real data-backed tier-colored CMD traces to a Plotly subplot."""
+    tier_order, tier_colors = plotly_tier_style()
+    plot_df = df.copy()
+    plot_df["_plot_tier"] = np.asarray(tier_values, dtype=object)
+    valid = plot_df[mag_col].notna() & plot_df[color_col].notna()
+    hover_cols = plotly_hover_columns(plot_df)
+    customdata = plot_df[hover_cols].astype(str).values if hover_cols else None
+    hovertemplate = "BP-RP=%{x}<br>G=%{y}<br>tier=%{meta}<extra></extra>"
+
+    for tier_name in tier_order:
+        mask = valid & (plot_df["_plot_tier"] == tier_name)
+        if not mask.any():
+            continue
+        fig.add_trace(
+            go.Scattergl(
+                x=plot_df.loc[mask, color_col],
+                y=plot_df.loc[mask, mag_col],
+                mode="markers",
+                name=f"{tier_name} (N={int(mask.sum())})",
+                marker=dict(size=5, color=tier_colors[tier_name], opacity=0.75),
+                customdata=customdata[mask.values] if customdata is not None else None,
+                meta=tier_name,
+                hovertemplate=hovertemplate,
+                showlegend=showlegend,
+            ),
+            row=row,
+            col=col,
+        )
+
+
+def save_interactive_three_model_cmd(df: pd.DataFrame, out_dir: Path, file_prefix: str, apply_extinction_correction: bool = False):
+    """Interactive three-panel PM/parallax/final CMD comparison."""
+    if not HAS_PLOTLY:
+        return
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    if mag_col not in df.columns or color_col not in df.columns:
+        return
+    fig = make_subplots(rows=1, cols=3, subplot_titles=("PM-only", "Parallax-only", "Final membership"))
+    for i, tier_col in enumerate(["pm_only_tier", "plx_only_tier", "final_tier"], start=1):
+        if tier_col in df.columns:
+            add_cmd_tier_traces(fig, df, df[tier_col].values, mag_col, color_col, 1, i, showlegend=(i == 1))
+        fig.update_xaxes(title_text=x_label, row=1, col=i)
+        fig.update_yaxes(title_text=y_label, autorange="reversed", row=1, col=i)
+    fig.update_layout(title=f"CMD three-model comparison{title_suffix}", template="plotly_white", height=720)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "cmd_three_model_comparison"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_cmd_three_model_comparison.html")
+
+
+def save_interactive_cmd_core_only_comparison(df, pm_prob, plx_prob, joint_prob, out_dir, file_prefix, apply_extinction_correction=False):
+    """Interactive three-panel core-only CMD comparison."""
+    if not HAS_PLOTLY:
+        return
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    if mag_col not in df.columns or color_col not in df.columns:
+        return
+    fig = make_subplots(rows=1, cols=3, subplot_titles=("PM core", "Parallax core", "Combined core"))
+    for i, (prob, label) in enumerate([(pm_prob, "PM"), (plx_prob, "Parallax"), (joint_prob, "Combined")], start=1):
+        ok = df[mag_col].notna() & df[color_col].notna() & (prob >= 0.8)
+        if ok.any():
+            fig.add_trace(go.Scattergl(x=df.loc[ok, color_col], y=df.loc[ok, mag_col], mode="markers",
+                                       name=f"{label} core N={int(ok.sum())}", marker=dict(size=6, color="royalblue", opacity=0.8)), row=1, col=i)
+        fig.update_xaxes(title_text=x_label, row=1, col=i)
+        fig.update_yaxes(title_text=y_label, autorange="reversed", row=1, col=i)
+    fig.update_layout(title=f"CMD core-only comparison{title_suffix}", template="plotly_white", height=720)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "cmd_core_only_comparison"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_cmd_core_only_comparison.html")
+
+
+def save_interactive_cmd_comparison_cuts(df, pm_prob, plx_prob, joint_prob, out_dir, file_prefix, apply_extinction_correction=False):
+    """Interactive three-panel 60-80/80+ CMD comparison."""
+    if not HAS_PLOTLY:
+        return
+    mag_col, color_col = select_cmd_photometry(df, apply_extinction_correction)
+    x_label, y_label, title_suffix = cmd_axis_labels(mag_col, color_col)
+    if mag_col not in df.columns or color_col not in df.columns:
+        return
+    fig = make_subplots(rows=1, cols=3, subplot_titles=("PM", "Parallax", "Combined"))
+    for i, (prob, label) in enumerate([(pm_prob, "PM"), (plx_prob, "Parallax"), (joint_prob, "Combined")], start=1):
+        for lo, hi, color, name in [(0.6, 0.8, "lightblue", "60-80%"), (0.8, 1.01, "mediumblue", "80%+")]:
+            ok = df[mag_col].notna() & df[color_col].notna() & (prob >= lo) & (prob < hi)
+            if ok.any():
+                fig.add_trace(go.Scattergl(x=df.loc[ok, color_col], y=df.loc[ok, mag_col], mode="markers",
+                                           name=f"{label} {name} N={int(ok.sum())}", marker=dict(size=5, color=color, opacity=0.75)), row=1, col=i)
+        fig.update_xaxes(title_text=x_label, row=1, col=i)
+        fig.update_yaxes(title_text=y_label, autorange="reversed", row=1, col=i)
+    fig.update_layout(title=f"CMD probability cuts comparison{title_suffix}", template="plotly_white", height=720)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "cmd_comparison_cuts"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_cmd_comparison_cuts.html")
+
+
+def save_interactive_probability_histograms(pm_prob, plx_prob, joint_prob, out_dir, file_prefix):
+    """Interactive versions of the two individual probability-distribution PNGs."""
+    if not HAS_PLOTLY:
+        return
+    fig = make_subplots(rows=1, cols=3, subplot_titles=("PM probability", "Parallax probability", "Combined probability"))
+    for i, (values, color) in enumerate([(pm_prob, "steelblue"), (plx_prob, "darkorange"), (joint_prob, "crimson")], start=1):
+        fig.add_trace(go.Histogram(x=np.asarray(values, dtype=float), nbinsx=50, marker_color=color), row=1, col=i)
+        fig.update_xaxes(title_text="Probability", row=1, col=i)
+        fig.update_yaxes(title_text="Number of sources", row=1, col=i)
+    fig.update_layout(title="Individual probability distributions", template="plotly_white", height=600, showlegend=False)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "individual_probabilities_full"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_individual_probabilities_full.html")
+
+    fig = make_subplots(rows=1, cols=3, subplot_titles=("PM probability 50%+", "Parallax probability 50%+", "Combined probability 50%+"))
+    for i, (values, color) in enumerate([(pm_prob, "steelblue"), (plx_prob, "darkorange"), (joint_prob, "crimson")], start=1):
+        vals = np.asarray(values, dtype=float)
+        vals = vals[np.isfinite(vals) & (vals >= 0.5)]
+        fig.add_trace(go.Histogram(x=vals, nbinsx=40, marker_color=color), row=1, col=i)
+        fig.update_xaxes(title_text="Probability", range=[0.5, 1], row=1, col=i)
+        fig.update_yaxes(title_text="Number of sources", row=1, col=i)
+    fig.update_layout(title="Individual probability distributions (50%+)", template="plotly_white", height=600, showlegend=False)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "individual_probabilities_50plus"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_individual_probabilities_50plus.html")
+
+
+
+
+
+def save_interactive_quadrature(df: pd.DataFrame, out_dir: Path, file_prefix: str):
+    """Interactive quadrature histogram from the same proper-motion data."""
+    if not HAS_PLOTLY or "pmra" not in df.columns or "pmdec" not in df.columns:
+        return
+    pm_total = np.sqrt(df["pmra"].astype(float) ** 2 + df["pmdec"].astype(float) ** 2)
+    fig = go.Figure(go.Histogram(x=pm_total[np.isfinite(pm_total)], nbinsx=500, marker_color="steelblue"))
+    fig.update_layout(title="Proper Motion Quadrature Distribution", xaxis_title="Total Proper Motion [mas/yr]",
+                      yaxis_title="Number of Stars", template="plotly_white", height=650)
+    fig.update_xaxes(range=[0, 100])
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "quadrature_analysis"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_quadrature_analysis.html")
+
+
+def save_interactive_qc_color_gradient(df: pd.DataFrame, out_dir: Path, file_prefix: str):
+    """Interactive color-gradient QC scatter from the same source columns."""
+    if not HAS_PLOTLY or any(col not in df.columns for col in ["ra", "dec", "phot_g_mean_mag", "bp_rp"]):
+        return
+    x, y, _, _ = add_projected_xy(df)
+    plot_df = df.copy()
+    plot_df["projected_x"] = x
+    plot_df["projected_y"] = y
+    plot_df["bp_rp_residual"] = plot_df["bp_rp"].astype(float) - np.nanmedian(plot_df["bp_rp"].astype(float))
+    ok = np.isfinite(plot_df["projected_x"]) & np.isfinite(plot_df["projected_y"]) & np.isfinite(plot_df["bp_rp_residual"])
+    plot_df = plot_df.loc[ok].copy()
+    if plot_df.empty:
+        return
+    fig = px.scatter(plot_df, x="projected_x", y="projected_y", color="bp_rp_residual", color_continuous_scale="RdBu_r",
+                     hover_data=plotly_hover_columns(plot_df), title="QC color-gradient diagnostic",
+                     labels={"projected_x": "Projected X [deg]", "projected_y": "Projected Y [deg]", "bp_rp_residual": "BP-RP residual"})
+    fig.update_layout(template="plotly_white", height=700)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "qc_color_gradient_diagnostic"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_qc_color_gradient_diagnostic.html")
+
+
+def save_interactive_blue_straggler_qc(df: pd.DataFrame, out_dir: Path, file_prefix: str):
+    """Interactive QC CMD/parallax overview using real CMD and parallax columns."""
+    if not HAS_PLOTLY or any(col not in df.columns for col in ["phot_g_mean_mag", "bp_rp", PARALLAX_COL]):
+        return
+    plot_df = df.copy()
+    ok = plot_df["phot_g_mean_mag"].notna() & plot_df["bp_rp"].notna() & plot_df[PARALLAX_COL].notna()
+    plot_df = plot_df.loc[ok].copy()
+    if plot_df.empty:
+        return
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("CMD", "Parallax distribution"))
+    color_col = "final_member_prob" if "final_member_prob" in plot_df.columns else None
+    marker = dict(size=5, opacity=0.7, color=plot_df[color_col], colorscale="Blues", cmin=0, cmax=1, showscale=True) if color_col else dict(size=5, opacity=0.7)
+    fig.add_trace(go.Scattergl(x=plot_df["bp_rp"], y=plot_df["phot_g_mean_mag"], mode="markers", name="CMD", marker=marker), row=1, col=1)
+    fig.add_trace(go.Histogram(x=plot_df[PARALLAX_COL], nbinsx=50, name="Parallax", marker_color="steelblue"), row=1, col=2)
+    fig.update_yaxes(autorange="reversed", title_text="G (mag)", row=1, col=1)
+    fig.update_xaxes(title_text="BP-RP", row=1, col=1)
+    fig.update_xaxes(title_text="Parallax (mas)", row=1, col=2)
+    fig.update_yaxes(title_text="Number of sources", row=1, col=2)
+    fig.update_layout(title="QC blue-straggler parallax validation overview", template="plotly_white", height=700)
+    fig.write_html(plotly_output_path(out_dir, file_prefix, "qc_blue_straggler_parallax_validation"), include_plotlyjs="cdn")
+    print(f"  Saved: {file_prefix}_qc_blue_straggler_parallax_validation.html")
+
+
+
+
+
+def generate_interactive_plot_suite(result_df, out_dir, file_prefix, apply_extinction_correction=False):
+    """Generate only the requested HTML plots in the selected render folder."""
+    if not HAS_PLOTLY:
+        return
+    has_pm = "pm_only_prob" in result_df and result_df["pm_only_prob"].notna().any()
+    has_plx = "plx_only_prob" in result_df and result_df["plx_only_prob"].notna().any()
+    has_joint = "joint_prob" in result_df and result_df["joint_prob"].notna().any()
+    save_interactive_three_model_cmd(result_df, out_dir, file_prefix, apply_extinction_correction)
     if has_pm:
-        pm_prob = result_df["pm_only_prob"].values
-
-        plot_cmd_colored_by_probability(
-            result_df, pm_prob, "PM-only probability",
-            out_dir, "cmd_pm_only.png", file_prefix
-        )
-
-        plot_cmd_core_only(
-            result_df, pm_prob, "PM-only probability",
-            out_dir, "cmd_pm_core_only.png", file_prefix, threshold=0.9
-        )
-
-        plot_cmd_pm_only_variant(result_df, pm_prob, out_dir, file_prefix)
-
-        plot_parallax_vs_pm_prob_scatter(result_df, pm_prob, out_dir, file_prefix)
-        plot_parallax_strip_by_tier(result_df, pm_prob, out_dir, file_prefix)
-        plot_parallax_vs_pm_prob_by_tier(result_df, pm_prob, out_dir, file_prefix)
-
-    if has_plx:
-        plx_prob = result_df["plx_only_prob"].values
-
-        plot_cmd_colored_by_probability(
-            result_df, plx_prob, "Parallax-only probability",
-            out_dir, "cmd_plx_only.png", file_prefix
-        )
-
-        plot_cmd_parallax_only_variant(result_df, plx_prob, out_dir, file_prefix)
-
-    if has_joint:
-        joint_prob = result_df["joint_prob"].values
-
-        plot_cmd_colored_by_probability(
-            result_df, joint_prob, "Joint 5D spatial+astrometric probability",
-            out_dir, "cmd_joint_5d.png", file_prefix
-        )
-
-        plot_cmd_core_only(
-            result_df, joint_prob, "Joint 5D probability",
-            out_dir, "cmd_joint_core_only.png", file_prefix, threshold=0.9
-        )
-
-        plot_cmd_combined_variant(result_df, joint_prob, out_dir, file_prefix)
-
+        save_interactive_cmd_probability(result_df, result_df["pm_only_prob"].values,
+            "PM-only probability", out_dir, "cmd_pm_only.html", file_prefix, apply_extinction_correction)
     if has_pm and has_plx and has_joint:
-        pm_prob = result_df["pm_only_prob"].values
-        plx_prob = result_df["plx_only_prob"].values
-        joint_prob = result_df["joint_prob"].values
-
-        plot_cmd_core_only_comparison(
-            result_df, pm_prob, plx_prob, joint_prob, out_dir, file_prefix
-        )
-
-        plot_cmd_comparison_cuts(
-            result_df, pm_prob, plx_prob, joint_prob, out_dir, file_prefix
-        )
-
-        plot_phase2_summary(
-            result_df, pm_prob, plx_prob, joint_prob, out_dir, file_prefix
-        )
-
-        plot_individual_probabilities(
-            pm_prob, plx_prob, joint_prob, out_dir, file_prefix
-        )
+        pm, plx, joint = (result_df[col].values for col in ["pm_only_prob", "plx_only_prob", "joint_prob"])
+        save_interactive_cmd_probability(result_df, joint, "P(cluster | PM + parallax)",
+            out_dir, "cmd_core_bayesian_only.html", file_prefix, apply_extinction_correction, threshold=0.8)
+        save_interactive_cmd_core_only_comparison(result_df, pm, plx, joint, out_dir, file_prefix, apply_extinction_correction)
+        save_interactive_cmd_comparison_cuts(result_df, pm, plx, joint, out_dir, file_prefix, apply_extinction_correction)
+        save_interactive_probability_histograms(pm, plx, joint, out_dir, file_prefix)
+    save_interactive_quadrature(result_df, out_dir, file_prefix)
+    save_interactive_qc_color_gradient(result_df, out_dir, file_prefix)
+    save_interactive_blue_straggler_qc(result_df, out_dir, file_prefix)
 
 
-def process_single_csv(csv_path: Path, outputs_dir: Path) -> None:
+def generate_all_plots(result_df, out_dir, file_prefix, plot_dirs: dict = None):
+    """Generate the requested plots, preserving format and extinction folders."""
+    has_extinction = has_precomputed_extinction_photometry(result_df)
+    if plot_dirs is None:
+        plot_dirs = make_plot_output_dirs(out_dir, include_extinction=has_extinction)
+    has_pm = "pm_only_prob" in result_df and result_df["pm_only_prob"].notna().any()
+    has_plx = "plx_only_prob" in result_df and result_df["plx_only_prob"].notna().any()
+    has_joint = "joint_prob" in result_df and result_df["joint_prob"].notna().any()
+    variants = [(False, "png", "html")]
+    if has_extinction:
+        variants.append((True, "png_with_extinction", "html_with_extinction"))
+    for corrected, png_key, html_key in variants:
+        png_dir = plot_dirs.get(png_key)
+        if HAS_MATPLOTLIB and png_dir is not None:
+            generate_three_model_cmd_plot(result_df, png_dir, file_prefix, corrected)
+            if has_pm:
+                plot_cmd_colored_by_probability(result_df, result_df["pm_only_prob"].values,
+                    "PM-only probability", png_dir, "cmd_pm_only.png", file_prefix, corrected)
+            if has_pm and has_plx and has_joint:
+                pm, plx, joint = (result_df[col].values for col in ["pm_only_prob", "plx_only_prob", "joint_prob"])
+                plot_cmd_core_only(result_df, joint, "P(cluster | PM + parallax)",
+                    png_dir, "cmd_core_bayesian_only.png", file_prefix, threshold=0.8,
+                    apply_extinction_correction=corrected)
+                plot_cmd_core_only_comparison(result_df, pm, plx, joint, png_dir, file_prefix, corrected)
+                plot_cmd_comparison_cuts(result_df, pm, plx, joint, png_dir, file_prefix, corrected)
+                plot_individual_probabilities(pm, plx, joint, png_dir, file_prefix)
+            plot_differential_reddening_color_gradient_diagnostic(result_df, png_dir, file_prefix)
+            plot_blue_straggler_parallax_validation(result_df, png_dir, file_prefix)
+            # The raw quadrature PNG is already produced while choosing the seed.
+            if corrected:
+                perform_quadrature_analysis(result_df, png_dir, file_prefix)
+        html_dir = plot_dirs.get(html_key)
+        if HAS_PLOTLY and html_dir is not None:
+            generate_interactive_plot_suite(result_df, html_dir, file_prefix, corrected)
+
+
+def process_single_csv(csv_path: Path, outputs_dir: Path, c_low: float = None, c_high: float = None) -> None:
     """Process a single CSV file with three-model analysis and save results"""
     print(f"\n{'='*60}")
     print(f"PROCESSING: {csv_path.name}")
@@ -2676,6 +3917,7 @@ def process_single_csv(csv_path: Path, outputs_dir: Path) -> None:
     file_prefix = csv_path.stem  # filename without .csv
     file_output_dir = outputs_dir / f"{file_prefix}_output"
     file_output_dir.mkdir(parents=True, exist_ok=True)
+    plot_dirs = make_plot_output_dirs(file_output_dir, include_extinction=False)
     print(f"Output subdirectory: {file_output_dir}")
     
     # Load astrometric data with quality cuts
@@ -2695,13 +3937,39 @@ def process_single_csv(csv_path: Path, outputs_dir: Path) -> None:
         print(f"Quality flags: {', '.join(quality_flags)}")
     
     # Step 1: Quadrature analysis (for reference only)
-    initial_guess = perform_quadrature_analysis(df, file_output_dir, file_prefix)
+    initial_guess = perform_quadrature_analysis(df, plot_dirs["png"], file_prefix)
     
     # Step 2: Three-model analysis
     result_df, quality_summary = run_three_model_analysis(
         pm_data, pmra_errors, pmdec_errors, parallax_data, parallax_errors,
-        df, file_output_dir, file_prefix
+        df, file_output_dir, file_prefix,
+        c_low=c_low, c_high=c_high,
     )
+
+    # Empirical differential-reddening correction for CMD diagnostics is always
+    # attempted once.  The correction surface is fit only from the 80%+ final
+    # core-membership group, then evaluated for every row.  If successful,
+    # corrected columns are saved to the result CSV and rendered as an additional
+    # plot suite under plots/*_with_extinction.
+    extinction_info = {"success": False, "reason": "not_attempted"}
+    print("\n=== PREPARING EMPIRICAL DIFFERENTIAL-REDDENING CMD COLUMNS ===")
+    print(
+        f"  Reference group for extinction surface: final_member_prob >= "
+        f"{CORE_MEMBER_PROB_THRESHOLD:.2f} (core members only)"
+    )
+    result_df, extinction_info = add_extinction_corrected_photometry(
+        result_df,
+        prob_col="final_member_prob",
+        prob_threshold=CORE_MEMBER_PROB_THRESHOLD,
+    )
+    if extinction_info.get("success", False):
+        print("  Saved corrected CMD columns to result table:")
+        print("    bp_rp_corrected, phot_g_mean_mag_corrected")
+        print("    bp_rp_extinction_delta, phot_g_extinction_delta")
+        print(f"  Extinction reference stars used: {extinction_info.get('n_reference_stars', 0)}")
+        plot_dirs = make_plot_output_dirs(file_output_dir, include_extinction=True)
+    else:
+        print(f"  Extinction correction unavailable: {extinction_info.get('reason', 'unknown')}")
     
     # Output validation
     assert np.all((result_df['pm_only_prob'] >= 0) & (result_df['pm_only_prob'] <= 1)) | np.isnan(result_df['pm_only_prob']).all(), "PM-only probabilities out of range"
@@ -2729,6 +3997,22 @@ def process_single_csv(csv_path: Path, outputs_dir: Path) -> None:
         'overall_status': quality_summary['overall_status'],
         'quality_flags': ', '.join(quality_summary['quality_flags']),
         'n_total': quality_summary['n_total'],
+        'max_pi_adaptive': quality_summary.get('max_pi_adaptive', np.nan),
+        'spatial_concentration': quality_summary.get('spatial_concentration', np.nan),
+        'spatial_c_low': quality_summary.get('spatial_c_low', np.nan),
+        'spatial_c_high': quality_summary.get('spatial_c_high', np.nan),
+        'extinction_correction_attempted': True,
+        'extinction_correction_success': bool(extinction_info.get('success', False)),
+        'extinction_correction_reason': extinction_info.get('reason', ''),
+        'extinction_reference_selection': extinction_info.get('reference_selection', ''),
+        'extinction_prob_col': extinction_info.get('prob_col', ''),
+        'extinction_prob_threshold': extinction_info.get('prob_threshold', np.nan),
+        'extinction_n_core_candidates': extinction_info.get('n_core_candidates', np.nan),
+        'extinction_n_reference_stars': extinction_info.get('n_reference_stars', np.nan),
+        'extinction_median_delta_bp_rp': extinction_info.get('median_correction_color', np.nan),
+        'extinction_median_delta_g': extinction_info.get('median_correction_mag', np.nan),
+        'extinction_max_abs_delta_bp_rp': extinction_info.get('max_correction_color', np.nan),
+        'extinction_max_abs_delta_g': extinction_info.get('max_correction_mag', np.nan),
         **quality_summary['overlaps']
     }])
     quality_csv = file_output_dir / f"{file_prefix}_quality_summary.csv"
@@ -2738,7 +4022,7 @@ def process_single_csv(csv_path: Path, outputs_dir: Path) -> None:
     # Step 3: Generate diagnostic plots
     if HAS_MATPLOTLIB:
         print("\n=== GENERATING DIAGNOSTIC PLOTS ===")
-        generate_all_plots(result_df, file_output_dir, file_prefix)
+        generate_all_plots(result_df, file_output_dir, file_prefix, plot_dirs=plot_dirs)
     
     print(f"\n=== COMPLETED: {csv_path.name} ===")
     print(f"Final quality status: {quality_summary['overall_status']}")
@@ -2790,10 +4074,47 @@ def main():
     for csv_file in csv_files:
         print(f"  - {csv_file.name}")
     
-    # Process each CSV file
+    # Pass 1: collect concentrations from astrometric probabilities
+    concentrations = []
     for csv_file in csv_files:
         try:
-            process_single_csv(csv_file, outputs_dir)
+            pm_data, pmra_errors, pmdec_errors, parallax_data, parallax_errors, df, _, _ = load_astrometric_data(csv_file)
+            if len(df) < MIN_MEMBERS:
+                continue
+            center_field_pm, cov_field_pm = fixed_field_component(pm_data)
+            pm_result = run_multi_seed_pm(pm_data, pmra_errors, pmdec_errors, center_field_pm, cov_field_pm)
+            plx_result = run_multi_seed_parallax(parallax_data, parallax_errors)
+            if pm_result['status'] == 'SUCCESS' and plx_result['status'] == 'SUCCESS':
+                pm_prob = np.clip(pm_result['best']['prob'], 0, 1)
+                plx_prob = np.clip(plx_result['best']['prob'], 0, 1)
+                astro_prob = pm_prob.copy()
+                bad_plx = plx_prob < 0.2
+                astro_prob[bad_plx] *= 0.5
+                x_sky, y_sky, _, _ = add_projected_xy(df)
+                c = compute_spatial_concentration(x_sky, y_sky, astro_prob)
+                if np.isfinite(c):
+                    concentrations.append(c)
+        except Exception:
+            continue
+
+    if len(concentrations) >= 5:
+        c_low = float(np.percentile(concentrations, 25))
+        c_high = float(np.percentile(concentrations, 80))
+        print(
+            f"Spatial calibration enabled: n={len(concentrations)}, "
+            f"c_low(p25)={c_low:.3f}, c_high(p80)={c_high:.3f}"
+        )
+    else:
+        c_low, c_high = None, None
+        print(
+            f"Spatial calibration unavailable (n={len(concentrations)} < 5); "
+            "using fallback concentration→weight mapping."
+        )
+
+    # Pass 2: final calibrated processing
+    for csv_file in csv_files:
+        try:
+            process_single_csv(csv_file, outputs_dir, c_low=c_low, c_high=c_high)
         except Exception as e:
             print(f"ERROR processing {csv_file.name}: {e}")
             continue
